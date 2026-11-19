@@ -109,8 +109,15 @@ fn unknown_words_and_empty_sides_in_new_text() {
         .unwrap();
     let lines: Vec<&str> = std::str::from_utf8(&text).unwrap().lines().collect();
     assert_eq!(lines.len(), 4);
-    let o = &trained.model.fwd.as_ref().unwrap().opts; // TEMP-DEBUG
-    assert!(lines[0].contains(" ||| -"), "{text:?} opts={o:?}");
+    // The synthetic corpus has lines with an empty source, so the length ratio is NaN (as in
+    // fast_align) and so is the score; the sign of that NaN depends on the CPU (negative on x86,
+    // positive on arm64). Any score is fine here; the point is that the line has one.
+    let score = lines[0].rsplit_once(" ||| ").map(|(_, s)| s.to_string());
+    let score = score.unwrap_or_else(|| panic!("no score in {}", lines[0]));
+    assert!(
+        score.parse::<f64>().is_ok() || score.ends_with("nan"),
+        "{score}"
+    );
     assert_eq!(lines[1], "");
     assert_eq!(lines[2], "");
     assert!(lines[3].starts_with("0-0 ||| "), "{}", lines[3]);

@@ -11,7 +11,7 @@ from conftest import ROOT, make_corpus
 
 
 def test_quick_start_runs_as_written(tmp_path, monkeypatch):
-    block = re.search(r"```python\n(.*?)```", (ROOT / "README.md").read_text(), re.DOTALL).group(1)
+    block = re.search(r"```python\n(.*?)```", (ROOT / "README.md").read_text().replace("\r\n", "\n"), re.DOTALL).group(1)
     src, tgt, _ = make_corpus(n=100)
     for stem, n in (("corpus", 100), ("new", 10)):
         Path(tmp_path / f"{stem}.en").write_text("".join(" ".join(s) + "\n" for s in src[:n]))
@@ -30,7 +30,7 @@ def test_quick_start_runs_as_written(tmp_path, monkeypatch):
 
 def test_subword_example_runs_as_written(tmp_path, monkeypatch):
     pytest.importorskip("sentencepiece")
-    blocks = re.findall(r"```python\n(.*?)```", (ROOT / "README.md").read_text(), re.DOTALL)
+    blocks = re.findall(r"```python\n(.*?)```", (ROOT / "README.md").read_text().replace("\r\n", "\n"), re.DOTALL)
     block = next(b for b in blocks if "subword" in b)
     src, tgt, _ = make_corpus(n=300)
     (tmp_path / "corpus.en").write_text("".join(" ".join(s) + "\n" for s in src))
