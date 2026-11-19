@@ -227,10 +227,14 @@ impl std::fmt::Display for G {
 mod tests {
     use super::*;
 
+    // The C printf comparison needs glibc-style output (`-nan`); macOS prints `nan`, and MSVC has no
+    // linkable `snprintf`. Linux (glibc and musl) is checked.
+    #[cfg(not(any(target_os = "macos", windows)))]
     extern "C" {
         fn snprintf(buf: *mut u8, n: usize, fmt: *const u8, ...) -> i32;
     }
 
+    #[cfg(not(any(target_os = "macos", windows)))]
     fn c_g(x: f64) -> String {
         let mut buf = [0u8; 64];
         // SAFETY: the buffer is large enough for any %.6g output and NUL-terminated by snprintf.
@@ -256,6 +260,7 @@ mod tests {
         assert_eq!(fmt_g(5e-324), "4.94066e-324");
     }
 
+    #[cfg(not(any(target_os = "macos", windows)))]
     #[test]
     fn g_matches_glibc_printf() {
         let mut state = 0x9e37_79b9_7f4a_7c15u64;
