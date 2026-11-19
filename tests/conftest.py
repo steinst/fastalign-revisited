@@ -14,6 +14,21 @@ FAST_ALIGN = ROOT / "reference" / "fast_align-src" / "build" / "fast_align"
 ATOOLS = ROOT / "reference" / "fast_align-src" / "build" / "atools"
 
 
+# Tests write and read text files; make that independent of the platform: UTF-8 and "\n" line
+# ends. (On Windows the defaults are cp1252 and "\r\n"; a "\r" at the end of a line becomes part of
+# the last token, as in fast_align, which changes the vocabulary and so the alignments.)
+def _write_text(self, data, encoding=None, errors=None, newline=None):
+    return self.write_bytes(data.encode(encoding or "utf-8", errors or "strict"))
+
+
+def _read_text(self, encoding=None, errors=None):
+    return self.read_bytes().decode(encoding or "utf-8", errors or "strict")
+
+
+Path.write_text = _write_text  # type: ignore[method-assign]
+Path.read_text = _read_text  # type: ignore[method-assign]
+
+
 def make_corpus(
     n: int = 400, vocab: int = 40, seed: int = 7, min_len: int = 3, max_len: int = 9
 ) -> tuple[list[list[str]], list[list[str]], list[list[int]]]:

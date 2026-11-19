@@ -109,7 +109,8 @@ fn unknown_words_and_empty_sides_in_new_text() {
         .unwrap();
     let lines: Vec<&str> = std::str::from_utf8(&text).unwrap().lines().collect();
     assert_eq!(lines.len(), 4);
-    assert!(lines[0].contains(" ||| -"), "{}", lines[0]);
+    let o = &trained.model.fwd.as_ref().unwrap().opts; // TEMP-DEBUG
+    assert!(lines[0].contains(" ||| -"), "{text:?} opts={o:?}");
     assert_eq!(lines[1], "");
     assert_eq!(lines[2], "");
     assert!(lines[3].starts_with("0-0 ||| "), "{}", lines[3]);
