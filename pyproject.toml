@@ -1,0 +1,33 @@
+[build-system]
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
+
+[project]
+name = "fastalign-revisited"
+description = "A modern, fast, bit-exact reimplementation of fast_align word alignment"
+readme = "README.md"
+requires-python = ">=3.9"
+license = "MIT OR Apache-2.0"
+license-files = ["LICENSE-MIT", "LICENSE-APACHE", "NOTICE"]
+dynamic = ["version"]
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: 3",
+    "Topic :: Text Processing :: Linguistic",
+]
+
+[project.scripts]
+fastalign = "fastalign.cli:main"
+
+[project.optional-dependencies]
+subword = ["sentencepiece"]
+dev = ["pytest", "numpy", "ruff", "sentencepiece"]
+
+[tool.maturin]
+manifest-path = "crates/fastalign-py/Cargo.toml"
+python-source = "python"
+module-name = "fastalign._core"
+features = ["pyo3/extension-module"]
+
+[tool.ruff]
+line-length = 100

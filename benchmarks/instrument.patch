@@ -1,0 +1,148 @@
+diff -ru fast_align-orig/src/fast_align.cc fast_align-instrumented/src/fast_align.cc
+--- fast_align-orig/src/fast_align.cc	2026-11-18 00:31:01.020576091 +0000
++++ fast_align-instrumented/src/fast_align.cc	2026-11-18 00:31:29.350587152 +0000
+@@ -20,6 +20,12 @@
+ #include <fstream>
+ #include <getopt.h>
+ #include <sstream>
++#include <cstdlib>
++#include <cstring>
++
++// instrumentation (benchmarks/instrument.patch): dumps go to $FA_DUMP, never to stdout/stderr
++std::ofstream* g_dump = nullptr;
++bool g_dump_buffers = false;
+ 
+ #include "src/corpus.h"
+ #include "src/ttables.h"
+@@ -220,6 +226,9 @@
+       (*outputs)[line_idx] = oss.str();
+     }
+   }
++  if (g_dump && g_dump_buffers)
++    *g_dump << "buffer " << iter << ' ' << lc << ' ' << lines.size() << " emp_feat " << emp_feat_
++            << " c0 " << c0_ << " likelihood " << likelihood_ << '\n';
+   *emp_feat += emp_feat_;
+   *c0 += c0_;
+   *likelihood += likelihood_;
+@@ -323,6 +332,11 @@
+     cerr << "--alpha must be > 0\n";
+     return 1;
+   }
++  if (const char* path = getenv("FA_DUMP")) {
++    g_dump = new std::ofstream(path);
++    *g_dump << std::hexfloat;
++    g_dump_buffers = getenv("FA_DUMP_BUFFERS") != nullptr;
++  }
+   const double prob_align_not_null = 1.0 - prob_align_null;
+   const unsigned kNULL = d.Convert("<eps>");
+   TTable s2t, t2s;
+@@ -337,6 +351,26 @@
+   } else {
+     InitialPass(kNULL, use_null, &s2t, &n_target_tokens, &tot_len_ratio, &size_counts);
+     s2t.Freeze();
++    if (g_dump) {
++      std::ofstream& o = *g_dump;
++      o << "initial n_target_tokens " << n_target_tokens << " tot_len_ratio " << tot_len_ratio
++        << " mean_srclen_multiplier " << mean_srclen_multiplier << " vocab " << d.max()
++        << " rows " << s2t.NumRows() << " freeze_copy_same_order " << s2t.CopyOrderSame() << '\n';
++      if (getenv("FA_DUMP_DICT"))
++        for (unsigned id = 1; id <= d.max(); ++id) o << "dict " << id << ' ' << d.Convert(id) << '\n';
++      o << "size_counts " << size_counts.size();
++      for (const auto& p : size_counts) o << ' ' << p.first.first << ',' << p.first.second << ',' << p.second;
++      o << '\n';
++      const char* rows = getenv("FA_DUMP_ROWS");
++      const std::string spec = rows ? rows : "1,2,3,4,5,6,7,8,9,10";
++      if (spec == "all") {
++        for (unsigned e = 0; e < s2t.NumRows(); ++e) s2t.DumpRow(o, e);
++      } else {
++        std::istringstream ss(spec);
++        for (std::string tok; std::getline(ss, tok, ',');) s2t.DumpRow(o, std::stoul(tok));
++      }
++      o << "hash counts " << std::hex << s2t.DumpHash(true) << " ttable " << s2t.DumpHash(false) << std::dec << '\n';
++    }
+   }
+ 
+   for (int iter = 0; iter < ITERATIONS; ++iter) {
+@@ -392,6 +426,9 @@
+     if (flag) {
+       cerr << endl;
+     }
++    if (g_dump)
++      *g_dump << "iter " << (iter + 1) << " tension " << diagonal_tension << " likelihood " << likelihood
++              << " c0 " << c0 << " emp_feat_sum " << emp_feat << '\n';
+     emp_feat /= n_target_tokens;
+     cerr << "  log_e likelihood: " << likelihood << endl;
+     cerr << "  log_2 likelihood: " << base2_likelihood << endl;
+@@ -411,6 +448,7 @@
+             for (short j = 1; j <= p.first; ++j)
+               mod_feat += size_counts[i].second * DiagonalAlignment::ComputeDLogZ(j, p.first, p.second, diagonal_tension);
+           }
++          if (g_dump) *g_dump << "tension_step " << (ii + 1) << " tension " << diagonal_tension << " mod_feat_sum " << mod_feat << '\n';
+           mod_feat /= n_target_tokens;
+           cerr << "  " << ii + 1 << "  model al-feat: " << mod_feat << " (tension=" << diagonal_tension << ")\n";
+           diagonal_tension += (emp_feat - mod_feat) * 20.0;
+@@ -419,10 +457,12 @@
+         }
+         cerr << "     final tension: " << diagonal_tension << endl;
+       }
++      if (g_dump) *g_dump << "counts_hash " << std::hex << s2t.DumpHash(true) << std::dec << " final_tension " << diagonal_tension << '\n';
+       if (variational_bayes)
+         s2t.NormalizeVB(alpha);
+       else
+         s2t.Normalize();
++      if (g_dump) *g_dump << "ttable_hash " << std::hex << s2t.DumpHash(false) << std::dec << '\n';
+     }
+   }
+   if (!force_align && !conditional_probability_filename.empty()) {
+@@ -491,5 +531,6 @@
+     } // loop over test set sentences
+     cerr << "TOTAL LOG PROB " << tlp << endl;
+   }
++  if (g_dump) { *g_dump << "end\n"; g_dump->close(); }
+   return 0;
+ }
+diff -ru fast_align-orig/src/ttables.h fast_align-instrumented/src/ttables.h
+--- fast_align-orig/src/ttables.h	2026-11-18 00:31:01.020625220 +0000
++++ fast_align-instrumented/src/ttables.h	2026-11-18 00:31:29.350395366 +0000
+@@ -20,6 +20,8 @@
+ #include <fstream>
+ #include <iostream>
+ #include <vector>
++#include <cstdint>
++#include <cstring>
+ 
+ #include "src/hashtables.h"
+ #include "src/corpus.h"
+@@ -138,6 +140,32 @@
+     }
+     return *this;
+   }
++  // --- instrumentation (benchmarks/instrument.patch): read-only dumps ---
++  uint64_t DumpHash(bool use_counts) const {
++    const Word2Word2Double& t = use_counts ? counts : ttable;
++    uint64_t h = 1469598103934665603ULL;
++    auto mix = [&h](uint64_t v) { for (int b = 0; b < 8; ++b) { h ^= (v >> (8 * b)) & 0xff; h *= 1099511628211ULL; } };
++    for (unsigned i = 0; i < t.size(); ++i)
++      for (const auto& kv : t[i]) { uint64_t bits; std::memcpy(&bits, &kv.second, 8); mix(i); mix(kv.first); mix(bits); }
++    return h;
++  }
++  void DumpRow(std::ostream& o, unsigned e) const {
++    if (e >= counts.size()) return;
++    o << "row " << e << ' ' << counts[e].bucket_count() << ' ' << counts[e].size();
++    for (const auto& kv : counts[e]) o << ' ' << kv.first;
++    o << '\n';
++  }
++  size_t NumRows() const { return counts.size(); }
++  bool CopyOrderSame() const {
++    if (ttable.size() != counts.size()) return false;
++    for (unsigned i = 0; i < counts.size(); ++i) {
++      if (ttable[i].bucket_count() != counts[i].bucket_count()) return false;
++      auto a = ttable[i].begin(); auto b = counts[i].begin();
++      for (; a != ttable[i].end() && b != counts[i].end(); ++a, ++b) if (a->first != b->first) return false;
++      if (a != ttable[i].end() || b != counts[i].end()) return false;
++    }
++    return true;
++  }
+   void ExportToFile(const char* filename, Dict& d, double BEAM_THRESHOLD) const {
+     std::ofstream file(filename);
+     for (unsigned i = 0; i < ttable.size(); ++i) {

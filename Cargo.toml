@@ -1,0 +1,20 @@
+[workspace]
+resolver = "2"
+members = ["crates/fastalign-core", "crates/fastalign-py"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+rust-version = "1.85"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+
+# Release build with line tables, for perf/flamegraphs (Step 9a). Build with frame pointers:
+# RUSTFLAGS="-C force-frame-pointers=yes" CARGO_TARGET_DIR=target/prof cargo build --profile profiling ...
+[profile.profiling]
+inherits = "release"
+debug = "line-tables-only"

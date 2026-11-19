@@ -1,0 +1,65 @@
+[package]
+name = "fastalign-core-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.fastalign-core]
+path = ".."
+
+[[bin]]
+name = "corpus_joined"
+path = "fuzz_targets/corpus_joined.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "corpus_pair"
+path = "fuzz_targets/corpus_pair.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "train_small"
+path = "fuzz_targets/train_small.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "model_read"
+path = "fuzz_targets/model_read.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "text_table"
+path = "fuzz_targets/text_table.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pharaoh"
+path = "fuzz_targets/pharaoh.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "subword"
+path = "fuzz_targets/subword.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

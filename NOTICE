@@ -1,0 +1,13 @@
+fastalign revisited
+Copyright (c) 2026 fastalign revisited contributors. Licensed under MIT OR Apache-2.0.
+
+This project is a new implementation of the algorithm and output behaviour of fast_align:
+
+  fast_align, https://github.com/clab/fast_align
+  Copyright Chris Dyer and contributors. Licensed under the Apache License 2.0.
+
+  Chris Dyer, Victor Chahuneau and Noah A. Smith (2013). A Simple, Fast, and Effective
+  Reparameterization of IBM Model 2. NAACL-HLT 2013 (ACL Anthology N13-1073).
+
+No fast_align source code is included in this repository. fast_align is used as a reference
+binary for parity testing only.

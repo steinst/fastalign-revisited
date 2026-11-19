@@ -1,0 +1,12 @@
+target/
+reference/
+dist/
+wheels/
+*.whl
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.so
+.pytest_cache/
+.ruff_cache/

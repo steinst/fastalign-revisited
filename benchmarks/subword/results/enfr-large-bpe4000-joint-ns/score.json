@@ -1,0 +1,26 @@
+{
+ "t_project": 18.97,
+ "t_symmetrize": 0.41,
+ "scores": {
+  "fwd": {
+   "precision": 76.48,
+   "recall": 89.9,
+   "aer": 18.96
+  },
+  "rev": {
+   "precision": 77.33,
+   "recall": 87.67,
+   "aer": 18.98
+  },
+  "proj-sym/grow-diag-final-and": {
+   "precision": 78.85,
+   "recall": 92.4,
+   "aer": 16.64
+  },
+  "sym-proj/grow-diag-final-and": {
+   "precision": 78.17,
+   "recall": 92.35,
+   "aer": 17.11
+  }
+ }
+}

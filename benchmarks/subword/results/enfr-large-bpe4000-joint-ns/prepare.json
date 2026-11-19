@@ -1,0 +1,19 @@
+{
+ "run": "enfr-large-bpe4000-joint-ns",
+ "type": "bpe",
+ "vocab": 4000,
+ "mode": "joint",
+ "pretok": "ns",
+ "t_read": 4.54,
+ "t_tok": 11.26,
+ "rss_tok_mb": 3180,
+ "t_encode": 7.43,
+ "lines": 1130551,
+ "src_ppw": 1.3608,
+ "tgt_ppw": 1.3517,
+ "src_tokens": 27238091,
+ "tgt_tokens": 31921194,
+ "seg_src": true,
+ "seg_tgt": true,
+ "rss_self_mb": 3180
+}
