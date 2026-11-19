@@ -31,7 +31,7 @@ jobs:
           if [ -d .venv/Scripts ]; then . .venv/Scripts/activate; else . .venv/bin/activate; fi
           pip install maturin pytest numpy ruff sentencepiece
           maturin develop --release
-          pytest
+          pytest -rf --tb=short
           ruff check python tests
 
   musl:

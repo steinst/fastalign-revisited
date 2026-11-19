@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import _thread
 import os
 import signal
+import sys
 import threading
 import time
 
@@ -17,7 +19,12 @@ pytestmark = pytest.mark.skipif(
 
 
 def _interrupt_after(delay: float) -> threading.Timer:
-    t = threading.Timer(delay, lambda: os.kill(os.getpid(), signal.SIGINT))
+    # On Windows os.kill(pid, SIGINT) terminates the process; interrupt_main raises the same
+    # KeyboardInterrupt in the main thread.
+    send = _thread.interrupt_main if sys.platform == "win32" else (
+        lambda: os.kill(os.getpid(), signal.SIGINT)
+    )
+    t = threading.Timer(delay, send)
     t.start()
     return t
 
