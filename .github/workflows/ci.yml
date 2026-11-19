@@ -15,7 +15,10 @@ jobs:
           python-version: "3.12"
       - run: cargo fmt --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
+      # The bit-exact maths vectors depend on the CPU's libm variant; see tests/math_vectors.rs.
       - run: cargo test --workspace
+        env:
+          FASTALIGN_MATH_VECTORS: tolerant
       - run: |
           python -m venv .venv
           . .venv/bin/activate

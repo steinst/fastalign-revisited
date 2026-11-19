@@ -31,4 +31,4 @@ First version. Build from source (see the README).
 ### Known differences from fast_align
 - NaN signs on stderr for an empty source side with `-d -o` (see README, Parity).
 - A last input line without a trailing newline is symmetrised once (atools does it twice).
-- Bit-exactness is defined on Linux/glibc only.
+- Bit-exactness is defined against fast_align on the same machine (Linux/glibc; the libm result depends on the CPU's FMA variant). The stored maths test vectors are bit-exact only on the machine that made them; CI compares them with a tolerance.

@@ -177,10 +177,16 @@ side and `-d -o`, where the tension becomes NaN, fast_align prints some NaNs as 
 `-nan`, and this tool sometimes picks the other sign (stdout and the `-p` table are still
 identical).
 
-Platform note: bit-exactness holds on **Linux with glibc**, because the model depends on the C
-library's `exp`, `log`, `pow` and `lgamma`. On macOS, Windows or musl the results are those of
-that platform's maths library and may differ in the last bits, and so, rarely, in an alignment
-line. Only Linux/glibc has been tested.
+Platform note: bit-exactness is defined against a fast_align running **on the same machine**,
+on Linux with glibc, because the model depends on the C library's `exp`, `log`, `pow` and
+`lgamma`, and glibc picks different code for them (FMA or not) depending on the CPU. Both tools
+call the same library, so they agree with each other; the stored test vectors of the maths
+functions (`crates/fastalign-core/tests/data/math`) come from one machine and differ in the last
+bits on another (GitHub's runners, or the same CPU with `GLIBC_TUNABLES=glibc.cpu.hwcaps=-FMA,-AVX2`).
+Hence CI runs them with a 1e-12 tolerance, and `benchmarks/parity.sh`, which compares with a
+fast_align you build yourself, is the real check. On macOS, Windows or musl the results are those
+of that platform's maths library and may differ in the last bits, and so, rarely, in an alignment
+line. Only Linux/glibc on one CPU has been tested.
 
 With subwords off, nothing in training, decoding or output changes. With subwords on, the
 aligner is the same one (our output on a piece file equals fast_align's on the same file), but the
