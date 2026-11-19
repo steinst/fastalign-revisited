@@ -4,7 +4,15 @@ on:
   pull_request:
 jobs:
   test:
-    runs-on: ubuntu-latest
+    name: test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      # The bit-exact maths vectors depend on the platform's libm; see tests/math_vectors.rs.
+      FASTALIGN_MATH_VECTORS: tolerant
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -15,14 +23,59 @@ jobs:
           python-version: "3.12"
       - run: cargo fmt --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
-      # The bit-exact maths vectors depend on the CPU's libm variant; see tests/math_vectors.rs.
       - run: cargo test --workspace
-        env:
-          FASTALIGN_MATH_VECTORS: tolerant
-      - run: |
+      - name: Python package
+        shell: bash
+        run: |
           python -m venv .venv
-          . .venv/bin/activate
+          if [ -d .venv/Scripts ]; then . .venv/Scripts/activate; else . .venv/bin/activate; fi
           pip install maturin pytest numpy ruff sentencepiece
           maturin develop --release
           pytest
           ruff check python tests
+
+  musl:
+    name: test (linux musl)
+    runs-on: ubuntu-latest
+    env:
+      FASTALIGN_MATH_VECTORS: tolerant
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: cargo test -p fastalign-core --target x86_64-unknown-linux-musl
+
+  # Parity with a real fast_align built on the same runner (edge-case corpora, benchmarks/edge_parity.py).
+  # Linux/glibc must match byte for byte. macOS is informational: its C++ library (libc++) orders
+  # unordered_map differently from the libstdc++ order this project emulates, and arm64 may fuse
+  # multiply-adds, so differences are expected there and are reported, not hidden.
+  parity:
+    name: parity (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            report_only: ""
+          - os: macos-latest
+            report_only: "--report-only"
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build fast_align (reference, commit cab1e9a)
+        run: |
+          git clone https://github.com/clab/fast_align ../fast_align
+          git -C ../fast_align checkout cab1e9a
+          cmake -S ../fast_align -B ../fast_align/build -DCMAKE_BUILD_TYPE=Release
+          cmake --build ../fast_align/build -j 4
+      - run: cargo build --release -p fastalign-core
+      - name: Compare with fast_align
+        run: python benchmarks/edge_parity.py ${{ matrix.report_only }}
+        env:
+          FAST_ALIGN: ${{ github.workspace }}/../fast_align/build/fast_align

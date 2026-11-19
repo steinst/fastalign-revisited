@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Edge-case parity: run real fast_align and our CLI on generated odd inputs and compare.
 
-    edge_parity.py [--bin target/release/fastalign] [--keep DIR]
+    edge_parity.py [--bin target/release/fastalign] [--keep DIR] [--report-only]
+
+The reference binary is reference/fast_align-src/build/fast_align, or $FAST_ALIGN.
 
 Every case is a (name, input bytes, fast_align flags) triple. Both programs run with
 OMP_NUM_THREADS=1 / --threads 1 and 4. Compared: stdout (alignments) and the statistics on stderr
@@ -20,7 +22,7 @@ import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-FA = ROOT / "reference/fast_align-src/build/fast_align"
+FA = Path(os.environ.get("FAST_ALIGN") or ROOT / "reference/fast_align-src/build/fast_align")
 PROGRESS = re.compile(rb"^\.*( \[\d+\])?$")
 TABLE_LINE = re.compile(rb"^conditional probabilities: .*$")
 NAN_SIGN = re.compile(rb"-nan")
@@ -217,6 +219,7 @@ def main():
     ap.add_argument("--bin", default=str(ROOT / "target/release/fastalign"))
     ap.add_argument("--keep")
     ap.add_argument("--only")
+    ap.add_argument("--report-only", action="store_true", help="always exit 0 (informational runs)")
     a = ap.parse_args()
     tmp = Path(a.keep) if a.keep else Path(tempfile.mkdtemp())
     tmp.mkdir(exist_ok=True)
@@ -263,7 +266,7 @@ def main():
     nfail += forced_cases(a.bin, tmp)
     if not a.keep:
         import shutil; shutil.rmtree(tmp, ignore_errors=True)
-    return 1 if nfail else 0
+    return 0 if (a.report_only or not nfail) else 1
 
 
 if __name__ == "__main__":
