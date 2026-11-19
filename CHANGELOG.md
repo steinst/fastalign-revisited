@@ -28,6 +28,10 @@ First version. Build from source (see the README).
 - 14.4 s at 20 threads, 112 s at 1 thread; fast_align + atools 78 s and 616 s.
 - Peak memory 1.52 GB (CLI); fast_align 2.9 GB per direction.
 
+### Platforms
+- CI builds and tests on Linux (glibc and musl), macOS arm64 and Windows; parity with a fast_align
+  built on the runner: Linux 58/58 + 66/66, macOS arm64 53/58 + 66/66 (see README).
+
 ### Known differences from fast_align
 - NaN signs on stderr for an empty source side with `-d -o` (see README, Parity).
 - A last input line without a trailing newline is symmetrised once (atools does it twice).

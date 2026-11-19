@@ -186,7 +186,18 @@ bits on another (GitHub's runners, or the same CPU with `GLIBC_TUNABLES=glibc.cp
 Hence CI runs them with a 1e-12 tolerance, and `benchmarks/parity.sh`, which compares with a
 fast_align you build yourself, is the real check. On macOS, Windows or musl the results are those
 of that platform's maths library and may differ in the last bits, and so, rarely, in an alignment
-line. Only Linux/glibc on one CPU has been tested.
+line. Only Linux/glibc on one CPU has been tested for the bit-exact claim; the continuous
+integration (GitHub Actions) also builds and tests the project elsewhere:
+
+| platform (CI job) | build + tests | parity with a fast_align built on the same runner |
+|---|---|---|
+| Linux x86-64, glibc | pass | **identical**: 58/58 training cases and 66/66 forced-alignment cases of `benchmarks/edge_parity.py` |
+| Linux x86-64, musl | pass | not run |
+| macOS arm64 | pass | 53/58 training cases identical, 5 differ (four `-p` tables and one random corpus), 66/66 forced alignments identical; informational: Apple's C++ library orders hash tables differently from libstdc++ and its maths library differs |
+| Windows x86-64 (MSVC) | pass | not run (fast_align does not build there) |
+
+On Windows, files with CRLF line ends keep the `\r` as part of the last token of each line, as
+in fast_align.
 
 With subwords off, nothing in training, decoding or output changes. With subwords on, the
 aligner is the same one (our output on a piece file equals fast_align's on the same file), but the
