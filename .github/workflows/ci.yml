@@ -8,7 +8,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [ubuntu-24.04, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     env:
       # The bit-exact maths vectors depend on the platform's libm; see tests/math_vectors.rs.
@@ -44,7 +44,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: ubuntu-24.04
             require: native,reference
           - os: windows-latest
             require: native
@@ -78,7 +78,7 @@ jobs:
   # Minimum supported toolchains: the declared rust-version and the lowest supported Python.
   minimum-rust:
     name: minimum Rust (1.85)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     env:
       FASTALIGN_MATH_VECTORS: tolerant
     steps:
@@ -88,7 +88,7 @@ jobs:
 
   minimum-python:
     name: minimum Python (3.9)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     env:
       FASTALIGN_MATH_VECTORS: tolerant
     steps:
@@ -107,7 +107,7 @@ jobs:
 
   musl:
     name: test (linux musl)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     env:
       FASTALIGN_MATH_VECTORS: tolerant
     steps:
@@ -128,7 +128,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: ubuntu-24.04
             report_only: ""
           - os: macos-latest
             report_only: "--report-only"

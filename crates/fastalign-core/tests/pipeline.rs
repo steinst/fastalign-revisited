@@ -476,7 +476,10 @@ mod degenerate {
                 assert!(!t.inv.as_ref().unwrap().nonfinite.any());
             } else {
                 assert!(fwd.nonfinite.mean_srclen_multiplier.unwrap().is_nan());
-                assert!(fwd.alignments.starts_with(b"0-0 1-1 2-2 ||| -nan\n"));
+                // the sign of a NaN is platform-dependent ("-nan" on x86 glibc, "nan" on arm64)
+                let first = fwd.alignments.split(|&b| b == b'\n').next().unwrap();
+                assert!(first.starts_with(b"0-0 1-1 2-2 ||| "));
+                assert!(first.ends_with(b"nan"));
             }
             // skip: the 20 good pairs' results and an empty line
             let corpus = read(&text, None, EmptyPairs::Skip);

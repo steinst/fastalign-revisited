@@ -105,7 +105,10 @@ Behaviour changes, each with what to do:
   number of distinct words a model has seen; files are cut into pieces through temporary piece
   files instead of Python lists. Results are unchanged.
 
-@@PERF@@
+### Performance (en-fr large, 1.13M lines, both directions + grow-diag-final-and)
+- Median of three, `quiet_run` (`IDLE_CPUS=1.5`; other load 0.7-4.4 CPUs, all 20 CPUs allowed): 13.6 s at 20
+  threads (13.1-15.5), 111.4 s at 1 thread (111.0-116.7). Peak RSS 1.44 GB (20 threads), 1.37 GB (1 thread).
+  Outputs identical to golden in every run.
 
 ## 0.1.0 (first version; not published on PyPI)
 

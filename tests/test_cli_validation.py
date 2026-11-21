@@ -167,7 +167,7 @@ def test_score_is_marginal_not_best_path(tmp_path):
     """Two source words are equally likely to have produced the one target word. The score
     sums over both alignments (log 0.5), the best path alone would give log 0.25."""
     table = tmp_path / "table"
-    write_text(table, "e1\tf\t%r\ne2\tf\t%r\n" % (math.log(0.5), math.log(0.5)))
+    write_text(table, f"e1\tf\t{math.log(0.5)!r}\ne2\tf\t{math.log(0.5)!r}\n")
     inp = tmp_path / "in.txt"
     write_text(inp, "e1 e2 ||| f\n")
     res = fastalign.align_with_table(
