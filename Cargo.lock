@@ -252,7 +252,7 @@ dependencies = [
 
 [[package]]
 name = "fastalign-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "clap",
  "criterion",
@@ -265,7 +265,7 @@ dependencies = [
 
 [[package]]
 name = "fastalign-py"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "fastalign-core",
  "pyo3",

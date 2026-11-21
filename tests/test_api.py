@@ -5,10 +5,11 @@ import subprocess
 
 import fastalign
 import pytest
+from textio import read_text
 
 
 def lines(path):
-    return path.read_text().split("\n")[:-1]
+    return read_text(path).split("\n")[:-1]
 
 
 # -- training: inputs -----------------------------------------------------------------------
@@ -35,6 +36,26 @@ def test_thread_count_does_not_change_output(corpus):
         for t in (1, 2, 5)
     }
     assert len(outs) == 1
+
+
+@pytest.mark.parametrize("threads", [1, 3])
+def test_offset_cache_does_not_change_output(corpus, threads):
+    src, tgt, _ = corpus
+    outs = {
+        fastalign.train(src, tgt, threads=threads, offset_cache_mb=mb, scores=True)
+        .alignments(direction=d)
+        .to_bytes()
+        for mb in (0, 1, 64)
+        for d in ("fwd", "inv")
+    }
+    assert len(outs) == 2
+
+
+@pytest.mark.parametrize("bad", [-1, 1.5, True, "8"])
+def test_offset_cache_rejects_bad_values(corpus, bad):
+    src, tgt, _ = corpus
+    with pytest.raises(ValueError, match="offset_cache_mb"):
+        fastalign.train(src, tgt, offset_cache_mb=bad)
 
 
 def test_lookup_index_does_not_change_output(corpus):
@@ -151,7 +172,10 @@ def test_empty_sides_give_empty_alignments(corpus):
     s2, t2 = [list(x) for x in src[:50]], [list(x) for x in tgt[:50]]
     s2[3] = []
     t2[7] = []
-    m = fastalign.train(s2, t2)
+    # fast_align's arithmetic: the empty source side makes both directions nonfinite, reported
+    with pytest.warns(RuntimeWarning, match=r"line 4 \(source side empty\), line 8"):
+        m = fastalign.train(s2, t2)
+    assert len(m.training_warnings) == 2
     al = m.alignments(direction="fwd")
     assert len(al) == 50 and al[3] == [] and al[7] == []
     assert "Error in line" in m.training_log("fwd")
@@ -216,8 +240,10 @@ def test_train_input_errors(corpus, tmp_path):
     src, tgt, _ = corpus
     with pytest.raises(ValueError, match="sentences but|different numbers"):
         fastalign.train(src[:10], tgt[:9])
-    with pytest.raises(ValueError, match="no sentence pairs"):
-        fastalign.train([], [])
+    # an empty corpus trains (nothing) as in the native CLI and fast_align, with a warning
+    with pytest.warns(RuntimeWarning, match="no line pairs"):
+        empty = fastalign.train([], [])
+    assert empty.alignments().to_bytes() == b"" and empty.n_lines == 0
     with pytest.raises(TypeError):
         fastalign.train(src[:3])  # a single list is not a joined file
     with pytest.raises(FileNotFoundError):
@@ -331,7 +357,7 @@ def test_write_table_and_align_with_table(corpus, tmp_path):
     m = fastalign.train(src, tgt, directions="fwd")
     table = tmp_path / "t"
     m.write_table(table)
-    assert table.read_text().count("\n") > 30
+    assert read_text(table).count("\n") > 30
     p = m.parameters("fwd")
     res = fastalign.align_with_table(
         table, src[:20], tgt[:20], tension=p["tension"], mean_length_multiplier=1.0

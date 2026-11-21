@@ -39,6 +39,8 @@ class Model:
     @property
     def n_lines(self) -> int | None: ...
     @property
+    def training_warnings(self) -> list[str]: ...
+    @property
     def subword(self) -> tuple[str, str, list[bytes], bytes] | None:
         """``(kind, marker, tokenizer models, settings)`` of a model trained on subword pieces."""
     def parameters(self, direction: str) -> tuple[float, float, int, float]: ...
@@ -87,11 +89,16 @@ def train(
     null: bool,
     buffer_size: int,
     max_len: int | None,
+    empty_pairs: str,
     scores: bool,
     progress: Callable[[str, int, int, float, float, float, float, float], None] | None = None,
     lookup_index: bool = True,
     subword: tuple[str, bytes, list[bytes], bytes] | None = None,
     subword_output: bool = False,
+    keep_models: bool = True,
+    table_files: list[tuple[str, _Path]] | None = None,
+    table_beam: float = -4.0,
+    offset_cache_mb: int = 0,
 ) -> Model: ...
 def align_table(
     table: _Path,
@@ -106,8 +113,8 @@ def align_table(
     threads: int,
 ) -> tuple[bytes, bytes, int | None]: ...
 def symmetrize_many(
-    fwd: list[list[_Link]], inv: list[list[_Link]], method: str
+    fwd: list[list[_Link]], inv: list[list[_Link]], method: str, threads: int = 0
 ) -> list[list[_Link]]: ...
-def symmetrize_text(fwd: bytes, inv: bytes | None, method: str) -> bytes: ...
+def symmetrize_text(fwd: bytes, inv: bytes | None, method: str, threads: int = 0) -> bytes: ...
 def invert_many(fwd: list[list[_Link]]) -> list[list[_Link]]: ...
 def parse_pharaoh(line: str) -> list[_Link]: ...

@@ -1,6 +1,7 @@
 //! fastalign-core: pure-Rust, bit-exact reimplementation of fast_align (no Python dependency).
 
 pub mod align;
+pub mod atomic;
 pub mod cancel;
 pub mod corpus;
 pub mod io;

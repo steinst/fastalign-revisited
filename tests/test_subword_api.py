@@ -12,6 +12,7 @@ import pytest
 from conftest import make_corpus
 from fastalign import subword as sw
 from fastalign.cli import main
+from textio import read_text, write_text
 
 MARK = "▁"
 
@@ -42,8 +43,8 @@ def segmented_corpus(n=300, seed=3):
 def piece_files(tmp_path):
     _, _, sp, tp, _, _ = segmented_corpus()
     a, b = tmp_path / "p.src", tmp_path / "p.tgt"
-    a.write_text("".join(" ".join(x) + "\n" for x in sp), encoding="utf-8")
-    b.write_text("".join(" ".join(x) + "\n" for x in tp), encoding="utf-8")
+    write_text(a, "".join(" ".join(x) + "\n" for x in sp), encoding="utf-8")
+    write_text(b, "".join(" ".join(x) + "\n" for x in tp), encoding="utf-8")
     return a, b
 
 
@@ -110,10 +111,11 @@ def test_identity_segmentation_equals_word_level(tmp_path, corpus_files):
     marked = []
     for p in (a, b):
         q = tmp_path / (p.name + ".marked")
-        q.write_text(
+        write_text(
+            q,
             "".join(
                 " ".join(MARK + w for w in line.split()) + "\n"
-                for line in p.read_text().splitlines()
+                for line in read_text(p).splitlines()
             ),
             encoding="utf-8",
         )
@@ -137,8 +139,8 @@ def test_continuation_marker_equals_prefix_marker_projection(tmp_path):
         return out
 
     a, b = tmp_path / "a", tmp_path / "b"
-    a.write_text("".join(" ".join(conv(x)) + "\n" for x in sp))
-    b.write_text("".join(" ".join(conv(x)) + "\n" for x in tp))
+    write_text(a, "".join(" ".join(conv(x)) + "\n" for x in sp))
+    write_text(b, "".join(" ".join(conv(x)) + "\n" for x in tp))
     m = fastalign.train(a, b, subword=fastalign.PreSegmented("@@", continuation=True))
     assert m.subword["kind"] == "continue" and m.subword["marker"] == "@@"
     link_ok = all(
@@ -242,8 +244,8 @@ def test_save_load_align_reproduces_training_alignments(tmp_path):
     assert all(0 <= i < 2 and 0 <= j < 2 for i, j in loaded.align(["zzzunseen", "q"], ["w", "e"]))
     # files work like lists
     f1, f2 = tmp_path / "s.txt", tmp_path / "t.txt"
-    f1.write_text("".join(" ".join(s) + "\n" for s in src))
-    f2.write_text("".join(" ".join(t) + "\n" for t in tgt))
+    write_text(f1, "".join(" ".join(s) + "\n" for s in src))
+    write_text(f2, "".join(" ".join(t) + "\n" for t in tgt))
     assert loaded.align_many(f1, f2).to_bytes() == model.alignments().to_bytes()
 
 
@@ -251,8 +253,8 @@ def test_save_load_align_reproduces_training_alignments(tmp_path):
 def test_python_cli_with_tokeniser_and_files_equal_api(tmp_path):
     src, tgt = morph_corpus(200)
     a, b = tmp_path / "s", tmp_path / "t"
-    a.write_text("".join(" ".join(s) + "\n" for s in src))
-    b.write_text("".join(" ".join(t) + "\n" for t in tgt))
+    write_text(a, "".join(" ".join(s) + "\n" for s in src))
+    write_text(b, "".join(" ".join(t) + "\n" for t in tgt))
     out = tmp_path / "o"
     rc = main(
         ["train", str(a), str(b), "-o", str(out), "-q", "--subword", "--subword-vocab", "300"]
@@ -273,7 +275,7 @@ def test_python_cli_with_tokeniser_and_files_equal_api(tmp_path):
     assert dest.read_bytes() == api.alignments(symmetrize="union").to_bytes()
     # a single `source ||| target` file gives the same corpus
     j = tmp_path / "joined"
-    j.write_text("".join(f"{' '.join(s)} ||| {' '.join(t)}\n" for s, t in zip(src, tgt)))
+    write_text(j, "".join(f"{' '.join(s)} ||| {' '.join(t)}\n" for s, t in zip(src, tgt)))
     assert (
         fastalign.train(str(j), subword=CFG).alignments().to_bytes() == api.alignments().to_bytes()
     )
@@ -357,7 +359,7 @@ def test_truncated_and_corrupt_subword_models(tmp_path):
 def test_missing_sentencepiece_is_a_clear_error(monkeypatch, corpus):
     src, tgt, _ = corpus
     monkeypatch.setitem(sys.modules, "sentencepiece", None)
-    with pytest.raises(ImportError, match=r"fastalign\[subword\]"):
+    with pytest.raises(ImportError, match=r"fastalign-revisited\[subword\].*\.\[subword\]"):
         fastalign.train(src, tgt, subword="auto")
 
 
@@ -373,10 +375,115 @@ def test_input_validation(tmp_path):
         == 1
     )
     s, t = tmp_path / "s", tmp_path / "t"
-    s.write_text("a ||| b\n")
-    t.write_text("c\n")
+    write_text(s, "a ||| b\n")
+    write_text(t, "c\n")
     with pytest.raises(ValueError, match="'\\|\\|\\|'"):
         fastalign.train(s, t, subword=CFG)
-    s.write_text("a\nb\n")
+    write_text(s, "a\nb\n")
     with pytest.raises(ValueError, match="different numbers of lines"):
         fastalign.train(s, t, subword=CFG)
+
+
+# -- native inference on a model with a tokeniser; model-file invariants (Step 19) ---------------
+
+
+def native_align(native, model, a, b=None, *extra):
+    files = [str(model), str(a)] + ([str(b)] if b else [])
+    return subprocess.run([str(native), "align", *files, *extra], check=False, capture_output=True)
+
+
+@sp_only
+def test_native_align_refuses_plain_words_for_a_tokeniser_model(tmp_path, native_binary):
+    # the review's case: 16 copies of one sentence pair; Python gives 0-0 1-1 2-2
+    src, tgt = [["red", "blue", "green"]] * 16, [["rouge", "bleu", "vert"]] * 16
+    for name, cfg in (
+        ("joint", fastalign.SubwordConfig(vocab_size=300)),
+        ("separate", fastalign.SubwordConfig(vocab_size=300, joint=False)),
+        ("one-sided", fastalign.SubwordConfig(vocab_size=300, segment="src")),
+    ):
+        m = fastalign.train(src, tgt, subword=cfg)
+        path = tmp_path / f"{name}.model"
+        m.save(path)
+        loaded = fastalign.Model.load(path)
+        assert loaded.align(src[0], tgt[0], direction="fwd") == [(0, 0), (1, 1), (2, 2)], name
+        a, b = tmp_path / f"{name}.src", tmp_path / f"{name}.tgt"
+        write_text(a, "red blue green\n")
+        write_text(b, "rouge bleu vert\n")
+        r = native_align(native_binary, path, a, b, "--direction", "fwd")
+        assert r.returncode != 0 and r.stdout == b"", name
+        assert b"tokeniser" in r.stderr and b"--input-segmented" in r.stderr, name
+        # explicitly segmented input (the pieces the model's tokeniser makes) works and agrees
+        segs = loaded._text_segmenters()
+        pa, pb = tmp_path / f"{name}.psrc", tmp_path / f"{name}.ptgt"
+        for out, seg, words in ((pa, segs[0], src[0]), (pb, segs[1], tgt[0])):
+            write_text(out, sw.encode_line([w.encode() for w in words], seg) + "\n")
+        r = native_align(native_binary, path, pa, pb, "--direction", "fwd", "--input-segmented")
+        assert r.returncode == 0, (name, r.stderr)
+        assert r.stdout == b"0-0 1-1 2-2\n", name
+
+
+def test_native_align_marker_only_model_needs_no_flag(tmp_path, native_binary, piece_files):
+    a, b = piece_files
+    m = fastalign.train(a, b, subword=fastalign.PreSegmented(MARK))
+    m.save(tmp_path / "m")
+    want = m.alignments(direction="fwd").to_bytes()
+    assert native_align(native_binary, tmp_path / "m", a, b).stdout == want
+    r = native_align(native_binary, tmp_path / "m", a, b, "--input-segmented")
+    assert r.returncode == 0 and r.stdout == want
+    assert fastalign.Model.load(tmp_path / "m").subword["tokenizer"] is False
+
+
+def _directionless(tmp_path, corpus):
+    src, tgt, _ = corpus
+    fastalign.train(src, tgt, iterations=1).save(tmp_path / "real")
+    raw = (tmp_path / "real").read_bytes()
+    n_words = int.from_bytes(raw[12:20], "little")
+    pos = 20
+    for _ in range(n_words):
+        pos += 4 + int.from_bytes(raw[pos : pos + 4], "little")
+    head = raw[:pos]
+    return head, raw[-8:], raw
+
+
+def test_python_load_requires_a_direction(tmp_path, corpus):
+    head, end, _ = _directionless(tmp_path, corpus)
+    (tmp_path / "none").write_bytes(head + b"\x00\x00" + b"\x00" + end)
+    with pytest.raises(ValueError, match="neither direction"):
+        fastalign.Model.load(tmp_path / "none")
+
+
+@sp_only
+def test_loader_checks_tokeniser_layout_and_count(tmp_path):
+    src, tgt = morph_corpus(60)
+    for cfg, patch, msg in (
+        (CFG, (b'"layout": "joint"', b'"layout": "sepxxx"'), "unreadable|not readable"),
+        (CFG, (b'"layout": "joint"', b'"layout": "separate"'), "inconsistent"),
+    ):
+        m = fastalign.train(src, tgt, subword=cfg, iterations=1)
+        m.save(tmp_path / "m")
+        raw = (tmp_path / "m").read_bytes()
+        at = raw.rindex(patch[0])
+        start = raw.rindex(b"{", 0, at)
+        old_len = int.from_bytes(raw[start - 4 : start], "little")
+        settings = raw[start : start + old_len].replace(*patch)
+        bad = raw[: start - 4] + len(settings).to_bytes(4, "little") + settings + raw[-8:]
+        (tmp_path / "bad").write_bytes(bad)
+        with pytest.raises(ValueError, match=msg):
+            fastalign.Model.load(tmp_path / "bad")
+
+
+def test_round_trip_through_table_export_and_alignment(tmp_path, corpus):
+    src, tgt, _ = corpus
+    for directions in ("both", "fwd", "inv"):
+        m = fastalign.train(src, tgt, directions=directions, iterations=2)
+        m.save(tmp_path / "m")
+        l = fastalign.Model.load(tmp_path / "m")
+        assert l.directions == m.directions
+        for d in m.directions:
+            m.write_table(tmp_path / "t1", d)
+            l.write_table(tmp_path / "t2", d)
+            assert (tmp_path / "t1").read_bytes() == (tmp_path / "t2").read_bytes()
+            assert (
+                l.align_many(src, tgt, direction=d).to_bytes()
+                == m.alignments(direction=d).to_bytes()
+            )

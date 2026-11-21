@@ -27,6 +27,9 @@ import io
 import json
 import os
 import re
+import shutil
+import stat
+import tempfile
 from array import array
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import asdict, dataclass
@@ -88,6 +91,10 @@ class WholeWords:
         text = decode_word(word)
         return [MARKER + text if self.marker else text]
 
+    def scoped(self, cache_size: int | None = None) -> WholeWords:
+        """Nothing to cache: the segmenter itself."""
+        return self
+
 
 def piece_text(pieces: Sequence[str]) -> str | None:
     """The text of a word's pieces, without the word-start marker; ``None`` if it is not a
@@ -103,24 +110,49 @@ def piece_text(pieces: Sequence[str]) -> str | None:
     return text[len(MARKER) :] if text.startswith(MARKER) else None
 
 
+#: Words cached by one ``align_many`` call's segmenter (:meth:`SentencePieceSegmenter.scoped`):
+#: the cache is emptied when it is full, so a call's memory is bounded (about 0.5 kB per entry)
+#: and nothing outlives the call.
+INFERENCE_CACHE_WORDS = 1 << 16
+#: Words cached across single-pair ``Model.align`` calls by a loaded model's stored segmenters
+#: (emptied when full: at most about 8 MB, whatever the queries).
+MODEL_CACHE_WORDS = 1 << 14
+
+
 class SentencePieceSegmenter:
     """Per-word encoding with a trained SentencePiece model (``model`` is the serialised proto).
 
     Results are cached per distinct word: the segmentation is a pure function of the word.
+    ``cache_size`` bounds the cache (it is emptied when full); ``None`` leaves it unbounded,
+    which suits a segmenter that lives for one run (training). A loaded model keeps one
+    segmenter per tokeniser with a :data:`MODEL_CACHE_WORDS` bound (used by single-pair calls)
+    and gives every ``align_many`` call its own :meth:`scoped` copy, so no cache grows with the
+    queries a model has seen. The tokeniser is never rebuilt.
     """
 
-    def __init__(self, model: bytes):
-        import sentencepiece as spm
+    def __init__(self, model: bytes, cache_size: int | None = None, *, _processor=None):
+        if _processor is None:
+            import sentencepiece as spm
 
+            _processor = spm.SentencePieceProcessor(model_proto=model)
         self.model = model
-        self._sp = spm.SentencePieceProcessor(model_proto=model)
+        self._sp = _processor
         self._cache: dict[bytes, list[str]] = {}
+        self._cache_size = cache_size
+
+    def scoped(self, cache_size: int | None = INFERENCE_CACHE_WORDS) -> SentencePieceSegmenter:
+        """A segmenter that shares this one's tokeniser (not rebuilt) with an empty cache of its
+        own, bounded by ``cache_size``."""
+        return SentencePieceSegmenter(self.model, cache_size, _processor=self._sp)
 
     def encode_word(self, word: bytes) -> list[str]:
-        hit = self._cache.get(word)
+        cache = self._cache
+        hit = cache.get(word)
         if hit is None:
             hit = self._encode(decode_word(word))
-            self._cache[word] = hit
+            if self._cache_size is not None and len(cache) >= self._cache_size:
+                cache.clear()
+            cache[word] = hit
         return hit
 
     def _encode(self, text: str) -> list[str]:
@@ -187,15 +219,53 @@ def train_model(
     """
     import sentencepiece as spm
 
+    seen = 0
+
     def sentences():
+        nonlocal seen
         for words in lines:
             texts = [t for t in map(decode_word, words) if MARKER not in t]
             if texts:
+                seen += 1
                 yield " ".join(texts)
 
     out = io.BytesIO()
+    try:
+        _spm_train(
+            spm,
+            sentences(),
+            out,
+            vocab_size,
+            model_type,
+            byte_fallback,
+            num_threads,
+            split_by_script,
+            split_by_number,
+        )
+    except RuntimeError:
+        if seen == 0:
+            # an empty corpus is legal for the aligner (it trains nothing); a tokeniser is not
+            raise ValueError(
+                "cannot train a subword tokeniser: the text has no words (an empty corpus or "
+                "an empty side); train without subword"
+            ) from None
+        raise
+    return out.getvalue()
+
+
+def _spm_train(
+    spm,
+    sentences,
+    out,
+    vocab_size,
+    model_type,
+    byte_fallback,
+    num_threads,
+    split_by_script,
+    split_by_number,
+):
     spm.SentencePieceTrainer.train(
-        sentence_iterator=sentences(),
+        sentence_iterator=sentences,
         model_writer=out,
         vocab_size=vocab_size,
         model_type=model_type,
@@ -214,7 +284,6 @@ def train_model(
         hard_vocab_limit=False,
         minloglevel=2,
     )
-    return out.getvalue()
 
 
 def train_segmenters(
@@ -344,7 +413,8 @@ def require_sentencepiece():
     except ImportError:
         raise ImportError(
             "subword alignment needs the optional dependency sentencepiece: "
-            "pip install 'fastalign[subword]'"
+            "pip install 'fastalign-revisited[subword]' (from a checkout: "
+            "pip install '.[subword]')"
         ) from None
     return sentencepiece
 
@@ -388,17 +458,19 @@ def _wholewords_marked() -> WholeWords:
     return WholeWords(marker=True)
 
 
-def make_segmenters(blobs: Sequence[bytes], layout: str) -> tuple[Segmenter, Segmenter]:
+def make_segmenters(
+    blobs: Sequence[bytes], layout: str, cache_size: int | None = None
+) -> tuple[Segmenter, Segmenter]:
     """The (source, target) segmenters of stored tokeniser models. ``layout`` is ``"joint"``
     (one model for both sides) or ``"separate"`` (source, target; an empty blob is a side that
-    stays word level)."""
+    stays word level). ``cache_size`` bounds each word cache (``None``: unbounded)."""
     require_sentencepiece()
     if layout == "joint" and len(blobs) == 1:
-        seg = SentencePieceSegmenter(blobs[0])
+        seg = SentencePieceSegmenter(blobs[0], cache_size)
         return seg, seg
     if layout == "separate" and len(blobs) == 2:
         return tuple(  # type: ignore[return-value]
-            SentencePieceSegmenter(b) if b else _wholewords_marked() for b in blobs
+            SentencePieceSegmenter(b, cache_size) if b else _wholewords_marked() for b in blobs
         )
     raise ValueError("the model's tokeniser settings are inconsistent")
 
@@ -427,53 +499,108 @@ def _check_words(words: list[bytes], where: str) -> list[bytes]:
     return words
 
 
-def _lines_of(source, name: str) -> Callable[[], Iterator[list[bytes]]]:
-    """A re-iterable view of one side of a corpus: a file (read lazily, line by line, as bytes)
-    or a list of sentences (strings split on whitespace, token lists)."""
+# The core's word rules (``corpus.rs``), so that segmentation sees exactly the words and sides
+# of the word-level workflow: only space and tab separate words (CR and other control bytes
+# are part of a word); in a joined line a tab is also a separator, and the first separator
+# (tab or the word ``|||``) splits source from target; two files are the two sides.
+_WORD = re.compile(rb"[^ \t]+")
+_WORD_OR_TAB = re.compile(rb"\t|[^ \t]+")
+_SEP = SEPARATOR.encode()
+
+
+def side_words(line: bytes) -> list[bytes]:
+    """The words of one line of a one-side file (no trailing newline), as the core reads it."""
+    return _WORD.findall(line)
+
+
+def joined_words(line: bytes) -> tuple[list[bytes], list[bytes]]:
+    """The (source, target) words of one ``source ||| target`` line, as the core reads it.
+    Separators after the first stay in the target as the word ``|||``."""
+    toks = [_SEP if t == b"\t" else t for t in _WORD_OR_TAB.findall(line)]
+    if _SEP not in toks:
+        return toks, []
+    i = toks.index(_SEP)
+    return toks[:i], toks[i + 1 :]
+
+
+def _raw_lines(source, spool_dir: str | None) -> tuple[Callable[[], Iterator[bytes]], str]:
+    """A re-iterable view of the lines (without ``\n``) of a file or of standard input already
+    read, and its name for messages. A path that is not a regular file (a pipe, FIFO or process
+    substitution) can be read only once: it is copied to ``spool_dir`` first."""
+    from fastalign._input import StdinText
+
+    if isinstance(source, StdinText):
+        data = bytes(source)
+        name = "<stdin>"
+
+        def opener():
+            return io.BytesIO(data)
+    else:
+        name = os.fspath(source)
+        path = name
+        if not stat.S_ISREG(os.stat(path).st_mode):
+            if spool_dir is None:
+                raise ValueError(f"{path}: not a regular file and nowhere to spool it")
+            fd, path = tempfile.mkstemp(dir=spool_dir, prefix="spool-")
+            with open(name, "rb") as fin, os.fdopen(fd, "wb") as fout:
+                shutil.copyfileobj(fin, fout, 1 << 20)
+
+        def opener():
+            return open(path, "rb")
+
+    def gen() -> Iterator[bytes]:
+        with opener() as f:
+            for line in f:
+                yield line[:-1] if line.endswith(b"\n") else line
+
+    return gen, name
+
+
+def _lines_of(source, name: str, spool_dir: str | None) -> Callable[[], Iterator[list[bytes]]]:
+    """A re-iterable view of one side of a corpus: a file (read lazily, line by line, as bytes,
+    words as in the core's paired reader) or a list of sentences (strings split on whitespace,
+    token lists)."""
     from fastalign._input import sentence_to_line, text_source
 
     src = text_source(source, name)
-    if isinstance(src, str):
+    if not isinstance(src, list):
+        lines, where = _raw_lines(src, spool_dir)
 
         def from_file() -> Iterator[list[bytes]]:
-            with open(src, "rb") as f:
-                for n, line in enumerate(f, 1):
-                    yield _check_words(line.split(), f"line {n} of {src}")
+            for n, line in enumerate(lines(), 1):
+                yield _check_words(side_words(line), f"line {n} of {where}")
 
         return from_file
 
-    lines = [sentence_to_line(s, name).encode("utf-8").split() for s in src]
-    return lambda: iter(lines)
+    words = [sentence_to_line(s, name).encode("utf-8").split() for s in src]
+    return lambda: iter(words)
 
 
-def _joined_sides(path: str):
+def _joined_sides(source, spool_dir: str | None):
     """The two sides of a ``source ||| target`` file (tab also separates, as in fast_align)."""
+    lines, where = _raw_lines(source, spool_dir)
 
     def side(k: int) -> Callable[[], Iterator[list[bytes]]]:
         def gen() -> Iterator[list[bytes]]:
-            with open(path, "rb") as f:
-                for n, line in enumerate(f, 1):
-                    if b"\t" in line:
-                        parts = line.split(b"\t", 1)
-                        words = [parts[0].split(), parts[1].split()]
-                    else:
-                        w = line.split()
-                        i = w.index(b"|||") if b"|||" in w else len(w)
-                        words = [w[:i], w[i + 1 :]]
-                    yield _check_words(words[k], f"line {n} of {path}")
+            for n, line in enumerate(lines(), 1):
+                yield _check_words(joined_words(line)[k], f"line {n} of {where}")
 
         return gen
 
     return side(0), side(1)
 
 
-def corpus_sides(src, tgt):
-    """Re-iterable (source, target) word-line views of the arguments of ``fastalign.train``."""
+def corpus_sides(src, tgt, spool_dir: str | None = None):
+    """Re-iterable (source, target) word-line views of the arguments of ``fastalign.train``,
+    with the sides and words of the word-level workflow. Inputs that can be read only once are
+    copied to ``spool_dir``."""
+    from fastalign._input import StdinText
+
     if tgt is None:
-        if not isinstance(src, (str, os.PathLike)):
+        if not isinstance(src, (str, os.PathLike, StdinText)):
             raise TypeError("a single text must be the path of a file of `source ||| target` lines")
-        return _joined_sides(os.fspath(src))
-    return _lines_of(src, "src"), _lines_of(tgt, "tgt")
+        return _joined_sides(src, spool_dir)
+    return _lines_of(src, "src", spool_dir), _lines_of(tgt, "tgt", spool_dir)
 
 
 def train_stream_segmenters(
@@ -507,6 +634,26 @@ def train_stream_segmenters(
     ]
     a, b = make_segmenters(blobs, "separate")
     return a, b, blobs, "separate"
+
+
+def scoped_segmenters(
+    segs: tuple[Segmenter, Segmenter], cache_size: int | None = INFERENCE_CACHE_WORDS
+) -> tuple[Segmenter, Segmenter]:
+    """One call's (source, target) segmenters: :meth:`SentencePieceSegmenter.scoped` copies of a
+    model's stored ones (a joint tokeniser stays one segmenter for both sides)."""
+    a, b = segs
+    sa = a.scoped(cache_size)  # type: ignore[attr-defined]
+    return (sa, sa) if b is a else (sa, b.scoped(cache_size))  # type: ignore[attr-defined]
+
+
+def write_piece_sides(sides, segs: tuple[Segmenter, Segmenter], paths: tuple[str, str]) -> None:
+    """Stream each side of ``sides`` (as :func:`corpus_sides` gives them), cut into pieces, to its
+    own file (one line of pieces per input line): nothing is held in memory but a line."""
+    for gen, seg, path in zip(sides, segs, paths):
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            for words in gen():
+                f.write(encode_line(words, seg))
+                f.write("\n")
 
 
 def encode_line(words: Sequence[bytes], seg: Segmenter) -> str:

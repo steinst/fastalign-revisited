@@ -21,8 +21,10 @@ pytestmark = pytest.mark.skipif(
 def _interrupt_after(delay: float) -> threading.Timer:
     # On Windows os.kill(pid, SIGINT) terminates the process; interrupt_main raises the same
     # KeyboardInterrupt in the main thread.
-    send = _thread.interrupt_main if sys.platform == "win32" else (
-        lambda: os.kill(os.getpid(), signal.SIGINT)
+    send = (
+        _thread.interrupt_main
+        if sys.platform == "win32"
+        else (lambda: os.kill(os.getpid(), signal.SIGINT))
     )
     t = threading.Timer(delay, send)
     t.start()

@@ -2,6 +2,7 @@
 //! The word-boundary parser and projection on arbitrary corpora and alignment text. The input is
 //! split at its first two 0xFF bytes into: corpus text (`src ||| tgt` lines), Pharaoh text and a
 //! marker; every boundary kind and both orders are tried.
+use fastalign_core::cancel::Cancel;
 use fastalign_core::corpus::{Corpus, LoadOptions};
 use fastalign_core::subword::{project_text, Boundary};
 use libfuzzer_sys::fuzz_target;
@@ -11,13 +12,13 @@ fuzz_target!(|data: &[u8]| {
     let corpus_text = parts.next().unwrap_or(&[]);
     let pharaoh = parts.next().unwrap_or(&[]);
     let marker = parts.next().unwrap_or(b"@@");
-    let corpus = Corpus::from_joined_bytes(corpus_text, &LoadOptions::default());
+    let corpus = Corpus::from_joined_bytes(corpus_text, &LoadOptions::default()).unwrap();
     for kind in ["start", "continue"] {
         let Ok(b) = Boundary::from_parts(kind, marker) else {
             continue;
         };
         for inverse in [false, true] {
-            let _ = project_text(&corpus, &b, pharaoh, inverse);
+            let _ = project_text(&corpus, &b, pharaoh, inverse, &Cancel::default());
         }
     }
     // a text with the right number of lines exercises the projection itself
@@ -31,7 +32,7 @@ fuzz_target!(|data: &[u8]| {
         .collect();
     for kind in ["start", "continue"] {
         if let Ok(b) = Boundary::from_parts(kind, marker) {
-            let _ = project_text(&corpus, &b, own.as_bytes(), false);
+            let _ = project_text(&corpus, &b, own.as_bytes(), false, &Cancel::default());
         }
     }
 });

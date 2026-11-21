@@ -38,11 +38,18 @@ SEED = 13
 def gold(corpus: str):
     pair = corpus.split("-")[0]
     with open(harness.CORPORA / pair / "gold.txt", encoding="utf-8") as f:
-        return aer.read_gold(f)
+        g = aer.read_gold(f)
+    if not g[0]:
+        raise ValueError(f"the gold file of {pair} has no sentences")
+    return g
 
 
 def counts(links: list, sure, poss) -> np.ndarray:
-    """Per-sentence (|A|, |S|, |A&S|, |A&P|)."""
+    """Per-sentence (|A|, |S|, |A&S|, |A&P|). The hypothesis must cover every gold sentence."""
+    if not (len(links) == len(sure) == len(poss)):
+        raise ValueError(
+            f"sentence count mismatch: {len(links)} hypotheses, {len(sure)} gold sentences"
+        )
     out = np.zeros((len(sure), 4), dtype=np.int64)
     for k, (a, s, p) in enumerate(zip(links, sure, poss)):
         a = {tuple(x) for x in a}
@@ -52,8 +59,13 @@ def counts(links: list, sure, poss) -> np.ndarray:
 
 
 def aer_of(c: np.ndarray) -> np.ndarray:
-    """AER (in %) from summed counts, last axis = the four counts."""
-    return 100 * (1 - (c[..., 2] + c[..., 3]) / (c[..., 0] + c[..., 1]))
+    """AER (in %) from summed counts, last axis = the four counts.
+
+    A zero denominator (no links and no sure links) gives 0, as ``aer.score`` does.
+    """
+    denom = c[..., 0] + c[..., 1]
+    num = c[..., 2] + c[..., 3]
+    return 100 * (1 - np.divide(num, denom, out=np.ones(denom.shape), where=denom > 0))
 
 
 _LINKS: dict = {}

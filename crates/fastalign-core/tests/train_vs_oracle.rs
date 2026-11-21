@@ -4,6 +4,7 @@
 //! tiny `-b`), with random training options and random tuning of the parallel trainer
 //! (row splitting, group size, prior cache), none of which may change a bit.
 
+use fastalign_core::cancel::Cancel;
 use fastalign_core::corpus::{Corpus, LoadOptions};
 use fastalign_core::oracle::{IterationStats, Oracle, TrainOptions};
 use fastalign_core::train::{train_both, ParallelOptions, Sinks, Trainer};
@@ -89,6 +90,8 @@ fn random_parallel(rng: &mut Rng) -> ParallelOptions {
         dense_min_row_len: rng.pick(&[0, 3, 1024]),
         block_lines: rng.pick(&[0, 1, 3, 16384]),
         sample_min_row_len: rng.pick(&[0, 1, 5, usize::MAX]),
+        line_cells: rng.pick(&[1, 2, 7, 1 << 20]),
+        offset_cache_bytes: rng.pick(&[0, 0, 40, 400, 4000, 1 << 30]),
     }
 }
 
@@ -138,7 +141,7 @@ fn run_oracle(c: &Corpus, opts: &TrainOptions) -> Trace {
 fn run_trainer(c: &Corpus, opts: &TrainOptions, popts: &ParallelOptions) -> Trace {
     let mut log = Vec::new();
     let mut out = Vec::new();
-    let mut t = Trainer::new(c, opts.clone(), popts.clone(), &mut log).unwrap();
+    let mut t = Trainer::new(c, opts.clone(), popts.clone(), &Cancel::default(), &mut log).unwrap();
     let n = opts.iterations.max(0) as usize;
     let mut iters = Vec::new();
     for it in 0..n {
@@ -188,7 +191,7 @@ fn check_cases(seeds: std::ops::Range<u64>, allow_empty: bool) {
         let text = random_corpus(&mut rng, allow_empty);
         let opts = random_options(&mut rng);
         let popts = random_parallel(&mut rng);
-        let c = Corpus::from_joined_bytes(&text, &LoadOptions::default());
+        let c = Corpus::from_joined_bytes(&text, &LoadOptions::default()).unwrap();
         let want = run_oracle(&c, &opts);
         for (threads, p) in &pools {
             let got = p.install(|| run_trainer(&c, &opts, &popts));
@@ -220,7 +223,7 @@ fn larger_corpus_many_buffers() {
     for _ in 0..12 {
         text.extend(random_corpus(&mut rng, false));
     }
-    let c = Corpus::from_joined_bytes(&text, &LoadOptions::default());
+    let c = Corpus::from_joined_bytes(&text, &LoadOptions::default()).unwrap();
     for (k, b) in [1u64, 13, 100, 10000].into_iter().enumerate() {
         let opts = TrainOptions {
             favor_diagonal: true,
@@ -243,6 +246,8 @@ fn larger_corpus_many_buffers() {
                     dense_min_row_len: 0,
                     block_lines: 7,
                     sample_min_row_len: 1,
+                    line_cells: 3,
+                    offset_cache_bytes: 3000,
                 },
             ] {
                 let got = pool(threads).install(|| run_trainer(&c, &opts, &popts));
@@ -263,7 +268,7 @@ fn both_directions_concurrently() {
     for _ in 0..5 {
         text.extend(random_corpus(&mut rng, false));
     }
-    let c = Corpus::from_joined_bytes(&text, &LoadOptions::default());
+    let c = Corpus::from_joined_bytes(&text, &LoadOptions::default()).unwrap();
     let fwd = TrainOptions {
         favor_diagonal: true,
         optimize_tension: true,
@@ -298,6 +303,7 @@ fn both_directions_concurrently() {
                         log: &mut lr,
                         out: &mut or,
                     },
+                    &Cancel::default(),
                 )
             })
             .unwrap();

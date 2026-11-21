@@ -2,6 +2,7 @@
 //! used (Step 10). Byte parity with fast_align on these inputs is checked by
 //! `benchmarks/edge_parity.py`, which needs the reference build.
 
+use fastalign_core::cancel::Cancel;
 use fastalign_core::corpus::{Corpus, LoadOptions};
 use fastalign_core::io::{Direction, Model};
 use fastalign_core::pipeline::{train, TrainConfig};
@@ -45,14 +46,16 @@ fn configs() -> Vec<TrainConfig> {
 #[test]
 fn degenerate_corpora_train_save_load_align() {
     for &text in INPUTS {
-        let corpus = Corpus::from_joined_bytes(text, &LoadOptions::default());
+        let corpus = Corpus::from_joined_bytes(text, &LoadOptions::default()).unwrap();
         for cfg in configs() {
-            let trained = train(&corpus, &cfg, &|_| {}).unwrap();
+            let trained = train(&corpus, &cfg, &|_| {}, &Cancel::default()).unwrap();
             let mut bytes = Vec::new();
             trained.model.write(&mut bytes).unwrap();
             let model = Model::read(&bytes[..], bytes.len() as u64).unwrap();
             for d in [Direction::Forward, Direction::Inverse] {
-                let text = model.align_corpus(&corpus, d, false).unwrap();
+                let text = model
+                    .align_corpus(&corpus, d, false, &Cancel::default())
+                    .unwrap();
                 assert_eq!(text.iter().filter(|&&b| b == b'\n').count(), corpus.len());
             }
         }

@@ -2,31 +2,30 @@
 
 from __future__ import annotations
 
+import os
 import random
 import shutil
+import sys
 from pathlib import Path
 
 import pytest
+from textio import write_text
 
 ROOT = Path(__file__).resolve().parent.parent
-NATIVE = ROOT / "target" / "release" / "fastalign"
+EXE = ".exe" if sys.platform == "win32" else ""
+NATIVE = ROOT / "target" / "release" / f"fastalign{EXE}"
 FAST_ALIGN = ROOT / "reference" / "fast_align-src" / "build" / "fast_align"
 ATOOLS = ROOT / "reference" / "fast_align-src" / "build" / "atools"
 
-
-# Tests write and read text files; make that independent of the platform: UTF-8 and "\n" line
-# ends. (On Windows the defaults are cp1252 and "\r\n"; a "\r" at the end of a line becomes part of
-# the last token, as in fast_align, which changes the vocabulary and so the alignments.)
-def _write_text(self, data, encoding=None, errors=None, newline=None):
-    return self.write_bytes(data.encode(encoding or "utf-8", errors or "strict"))
+# In the CI job that is meant to run the cross-frontend comparisons, FASTALIGN_REQUIRE lists the
+# executables that must exist (`native`, `reference`); a missing one is an error, not a skip.
+REQUIRED = set(filter(None, os.environ.get("FASTALIGN_REQUIRE", "").replace(",", " ").split()))
 
 
-def _read_text(self, encoding=None, errors=None):
-    return self.read_bytes().decode(encoding or "utf-8", errors or "strict")
-
-
-Path.write_text = _write_text  # type: ignore[method-assign]
-Path.read_text = _read_text  # type: ignore[method-assign]
+def _missing(kind: str, message: str):
+    if kind in REQUIRED:
+        pytest.fail(f"{message} (required by FASTALIGN_REQUIRE={os.environ['FASTALIGN_REQUIRE']})")
+    pytest.skip(message)
 
 
 def make_corpus(
@@ -61,8 +60,8 @@ def corpus():
 def corpus_files(tmp_path: Path, corpus):
     src, tgt, _ = corpus
     a, b = tmp_path / "c.src", tmp_path / "c.tgt"
-    a.write_text("".join(" ".join(s) + "\n" for s in src), encoding="utf-8")
-    b.write_text("".join(" ".join(t) + "\n" for t in tgt), encoding="utf-8")
+    write_text(a, "".join(" ".join(s) + "\n" for s in src), encoding="utf-8")
+    write_text(b, "".join(" ".join(t) + "\n" for t in tgt), encoding="utf-8")
     return a, b
 
 
@@ -70,8 +69,8 @@ def corpus_files(tmp_path: Path, corpus):
 def joined_file(tmp_path: Path, corpus):
     src, tgt, _ = corpus
     p = tmp_path / "c.joined"
-    p.write_text(
-        "".join(f"{' '.join(s)} ||| {' '.join(t)}\n" for s, t in zip(src, tgt)), encoding="utf-8"
+    write_text(
+        p, "".join(f"{' '.join(s)} ||| {' '.join(t)}\n" for s, t in zip(src, tgt)), encoding="utf-8"
     )
     return p
 
@@ -88,7 +87,7 @@ def model(corpus):
 def native_binary():
     """The native `fastalign` binary, if it has been built (`cargo build --release`)."""
     if not NATIVE.exists():
-        pytest.skip("native binary not built (cargo build --release)")
+        _missing("native", f"native binary not built ({NATIVE}; cargo build --release)")
     return NATIVE
 
 
@@ -96,12 +95,12 @@ def native_binary():
 def fast_align_binary():
     """The reference fast_align, if the local reference build exists."""
     if not FAST_ALIGN.exists():
-        pytest.skip("reference fast_align not built")
+        _missing("reference", "reference fast_align not built")
     return FAST_ALIGN
 
 
 @pytest.fixture(scope="session")
 def atools_binary():
     if not ATOOLS.exists() and not shutil.which("atools"):
-        pytest.skip("reference atools not built")
+        _missing("reference", "reference atools not built")
     return ATOOLS

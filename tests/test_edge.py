@@ -5,6 +5,10 @@ import subprocess
 import fastalign
 import pytest
 
+# These corpora are degenerate on purpose (and compared with fast_align): training reports the
+# nonfinite parameters fast_align's arithmetic gives them.
+pytestmark = pytest.mark.filterwarnings("ignore:.*nonfinite parameters:RuntimeWarning")
+
 TRICKY = (
     b"a b ||| x y\n"
     b"\n"

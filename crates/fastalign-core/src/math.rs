@@ -63,6 +63,55 @@ pub fn unnormalized_prob(i: u32, j: u32, m: u32, n: u32, lambda: f64) -> f64 {
     (feature(i, j, m, n) * lambda).exp()
 }
 
+/// Smallest magnitude of a starting tension (`-T`) the diagonal prior is defined for.
+///
+/// [`compute_z`] divides by `1 − exp(−λ/n)`, which is exactly 0 when `|λ/n|` is below about
+/// 2⁻⁵³: at λ = 0 for every sentence (fast_align then prints NaN everywhere), and for tiny λ on
+/// long sentences. With `|λ| ≥ 10⁻⁶` the ratio differs from 1 for every source length up to the
+/// corpus limit of 2³² tokens (`|λ|/n ≥ 2⁻²¹/2³² = 2⁻⁵³`). Tension optimisation keeps λ in
+/// `[0.1, 14]` after the first iteration, so only the starting value can be singular.
+pub const MIN_TENSION: f64 = 1e-6;
+
+/// Check a starting tension of the diagonal prior: finite and `|λ| ≥` [`MIN_TENSION`] (negative
+/// values are allowed, as in fast_align: they favour the anti-diagonal).
+pub fn check_tension(lambda: f64) -> Result<(), String> {
+    if !lambda.is_finite() || lambda.abs() < MIN_TENSION {
+        return Err(format!(
+            "the tension must be a finite number with magnitude at least {MIN_TENSION:e}, got \
+             {lambda} (the diagonal prior divides by 1 - exp(-tension/n), which is 0 at tension \
+             0; for a uniform prior turn the diagonal off)"
+        ));
+    }
+    Ok(())
+}
+
+/// Check the probability of the NULL word (`-q`): finite and in `[0, 1)`.
+pub fn check_p0(p0: f64) -> Result<(), String> {
+    if !(0.0..1.0).contains(&p0) {
+        return Err(format!("p0 must be a number in [0, 1), got {p0}"));
+    }
+    Ok(())
+}
+
+/// Check the Dirichlet prior (`-a`): always finite; positive when variational Bayes uses it.
+pub fn check_alpha(alpha: f64, variational_bayes: bool) -> Result<(), String> {
+    if !alpha.is_finite() {
+        return Err(format!("alpha must be a finite number, got {alpha}"));
+    }
+    if variational_bayes && alpha <= 0.0 {
+        return Err("alpha must be > 0 for variational Bayes".into());
+    }
+    Ok(())
+}
+
+/// Check a finite number option (`-t` beam threshold, `-m` length multiplier).
+pub fn check_finite(name: &str, v: f64) -> Result<(), String> {
+    if !v.is_finite() {
+        return Err(format!("{name} must be a finite number, got {v}"));
+    }
+    Ok(())
+}
+
 /// Normaliser of the diagonal prior for target position `i` (spec §12, `ComputeZ`).
 pub fn compute_z(i: u32, m: u32, n: u32, lambda: f64) -> f64 {
     let split = f64::from(i) * f64::from(n) / f64::from(m);

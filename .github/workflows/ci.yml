@@ -34,6 +34,77 @@ jobs:
           pytest -rf --tb=short
           ruff check python tests
 
+  # The cross-frontend comparisons (Python API == native CLI == real fast_align/atools) must run
+  # here: FASTALIGN_REQUIRE turns a missing executable into a test failure instead of a skip.
+  # The Windows runner has no reference fast_align, so it requires only the native binary
+  # (looked up as fastalign.exe).
+  frontends:
+    name: frontends (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            require: native,reference
+          - os: windows-latest
+            require: native
+    runs-on: ${{ matrix.os }}
+    env:
+      FASTALIGN_MATH_VECTORS: tolerant
+      FASTALIGN_REQUIRE: ${{ matrix.require }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build the reference fast_align and atools where it is required
+        if: contains(matrix.require, 'reference')
+        run: |
+          git clone https://github.com/clab/fast_align reference/fast_align-src
+          git -C reference/fast_align-src checkout cab1e9a
+          cmake -S reference/fast_align-src -B reference/fast_align-src/build -DCMAKE_BUILD_TYPE=Release -DCMAKE_POLICY_VERSION_MINIMUM=3.5
+          cmake --build reference/fast_align-src/build -j 4
+      - run: cargo build --release -p fastalign-core
+      - name: Python package and cross-frontend tests
+        shell: bash
+        run: |
+          python -m venv .venv
+          if [ -d .venv/Scripts ]; then . .venv/Scripts/activate; else . .venv/bin/activate; fi
+          pip install maturin pytest numpy sentencepiece
+          maturin develop --release
+          pytest -rs --tb=short tests/test_cli.py tests/test_subword.py tests/test_api.py tests/test_subword_api.py tests/test_edge.py tests/test_harness.py
+
+  # Minimum supported toolchains: the declared rust-version and the lowest supported Python.
+  minimum-rust:
+    name: minimum Rust (1.85)
+    runs-on: ubuntu-latest
+    env:
+      FASTALIGN_MATH_VECTORS: tolerant
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85
+      - run: cargo test --workspace --locked
+
+  minimum-python:
+    name: minimum Python (3.9)
+    runs-on: ubuntu-latest
+    env:
+      FASTALIGN_MATH_VECTORS: tolerant
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+      - run: |
+          python -m venv .venv
+          . .venv/bin/activate
+          pip install maturin pytest numpy sentencepiece
+          maturin develop --release
+          python -c "import sys, fastalign; print(sys.version, fastalign.__version__)"
+          pytest -rf --tb=short tests/test_api.py tests/test_cli.py tests/test_version.py tests/test_readme.py
+
   musl:
     name: test (linux musl)
     runs-on: ubuntu-latest

@@ -53,8 +53,18 @@ def sentence_to_line(sentence: Sentence, where: str) -> str:
     return " ".join(tokens)
 
 
-def text_source(source: TextSource, name: str) -> str | list[str]:
-    """A file path (as ``str``) or a list of single-space-joined sentences."""
+class StdinText(bytes):
+    """The bytes of standard input, read once by the command line for ``-`` (internal).
+
+    Passed through to the core as raw text in the corpus file format, like a file's content.
+    """
+
+
+def text_source(source: TextSource, name: str) -> str | list[str] | StdinText:
+    """A file path (as ``str``), a list of single-space-joined sentences, or standard input
+    already read (:class:`StdinText`, from the command line)."""
+    if isinstance(source, StdinText):
+        return source
     if isinstance(source, (str, os.PathLike)):
         return os.fspath(source)
     if isinstance(source, (bytes, bytearray)):

@@ -9,13 +9,17 @@
 //! `OUT_PREFIX.{fwd,rev,gdfa}`. Prints one `phase<TAB>direction<TAB>seconds` line per phase.
 //! Environment knobs (`ParallelOptions`): `FA_SPLIT_COST`, `FA_PRIOR_CACHE`, `FA_GROUP_LINES`,
 //! `FA_DENSE` (dense lookup index entries), `FA_DENSE_MIN_LEN`, `FA_BLOCK_LINES`,
-//! `FA_SAMPLE_MIN_LEN` (`u64::MAX` disables the sampled index).
+//! `FA_SAMPLE_MIN_LEN` (`u64::MAX` disables the sampled index), `FA_LINE_CELLS` (per-worker
+//! line probability matrix cells), `FA_OFFSET_CACHE` (bytes of the opt-in cell-offset cache per
+//! direction; prints `offset_cache_mib` and `offset_cache_hit`, the share of looked-up pairs it
+//! covers).
 
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::Path;
 use std::time::Instant;
 
+use fastalign_core::cancel::Cancel;
 use fastalign_core::corpus::{Corpus, LoadOptions};
 use fastalign_core::oracle::TrainOptions;
 use fastalign_core::pipeline::symmetrize_pharaoh;
@@ -115,6 +119,12 @@ fn main() {
     if let Some(v) = env("FA_SAMPLE_MIN_LEN") {
         popts.sample_min_row_len = v as usize;
     }
+    if let Some(v) = env("FA_OFFSET_CACHE") {
+        popts.offset_cache_bytes = v as usize;
+    }
+    if let Some(v) = env("FA_LINE_CELLS") {
+        popts.line_cells = v as usize;
+    }
     let t_start = Instant::now();
     let corpus = Corpus::read_joined(Path::new(input), &LoadOptions::default()).unwrap();
     println!("load\t-\t{:.3}", t_start.elapsed().as_secs_f64());
@@ -134,6 +144,7 @@ fn main() {
                 log: &mut re,
                 out: &mut ro,
             },
+            &Cancel::default(),
         )
         .unwrap();
         let total = t_train.elapsed().as_secs_f64();
@@ -145,8 +156,15 @@ fn main() {
             (rev, &mut ro, &mut re, "rev"),
         ] {
             let t0 = Instant::now();
-            let mut t = Trainer::new(&corpus, o, popts.clone(), log).unwrap();
+            let mut t = Trainer::new(&corpus, o, popts.clone(), &Cancel::default(), log).unwrap();
             t.train(log, out).unwrap();
+            if let Some((bytes, cached, total)) = t.offset_cache_stats() {
+                println!("offset_cache_mib\t{name}\t{}", bytes >> 20);
+                println!(
+                    "offset_cache_hit\t{name}\t{:.4}",
+                    cached as f64 / total.max(1) as f64
+                );
+            }
             report(
                 name,
                 &t.phase_times(),

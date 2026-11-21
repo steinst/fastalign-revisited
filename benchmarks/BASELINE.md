@@ -63,7 +63,7 @@ Alignment lines that differ from the 1-thread golden files (default config):
 
 Cause (to be confirmed in Step 3): the count update is an unsynchronised data race and the OpenMP
 reductions sum in thread order. This is why the parity target is defined against the
-single-threaded fast_align (see the README).
+single-threaded fast_align (see the project plan).
 
 ## Golden outputs
 

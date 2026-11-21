@@ -12,19 +12,21 @@ from pathlib import Path
 
 import fastalign
 import pytest
+from conftest import FAST_ALIGN, NATIVE, REQUIRED
 from fastalign import subword as sw
+from textio import read_text
 
 pytest.importorskip("sentencepiece")
 
 ROOT = Path(__file__).resolve().parent.parent
-NATIVE = ROOT / "target" / "release" / "fastalign"
-FAST_ALIGN = ROOT / "reference" / "fast_align-src" / "build" / "fast_align"
 CORPORA = ROOT / "reference" / "data" / "corpora"
 PROGRESS = re.compile(r"^\.*( \[\d+\])?$")
 
 needs_corpora = pytest.mark.skipif(not CORPORA.exists(), reason="reference corpora not present")
+# With FASTALIGN_REQUIRE naming them, missing executables make these tests fail instead of skip.
 needs_fast_align = pytest.mark.skipif(
-    not (FAST_ALIGN.exists() and NATIVE.exists()), reason="fast_align or native binary missing"
+    not (FAST_ALIGN.exists() and NATIVE.exists()) and not {"native", "reference"} <= REQUIRED,
+    reason="fast_align or native binary missing",
 )
 
 
@@ -119,7 +121,7 @@ def test_parity_on_pieces(pair, tiny_models, tmp_path):
             ln for ln in text.split("\n") if not ln.startswith("ARG=") and not PROGRESS.match(ln)
         ]
 
-    ours = (tmp_path / "ours.fwd.log").read_text()
+    ours = read_text(tmp_path / "ours.fwd.log")
     assert stats(g.stderr.decode()) == stats(ours)
 
 
@@ -238,6 +240,7 @@ def small_seg():
     return sw.train_segmenters(lines, lines, sw.SubwordConfig(vocab_size=300))[0]
 
 
+@pytest.mark.filterwarnings("ignore:.*nonfinite parameters:RuntimeWarning")
 def test_empty_lines_and_sides(small_seg, tmp_path):
     src = [[], words("the cat")[0], []]
     tgt = [words("la maison")[0], [], []]
@@ -246,7 +249,7 @@ def test_empty_lines_and_sides(small_seg, tmp_path):
     assert es.n_words == [0, 2, 0]
     path = tmp_path / "e.txt"
     sw.write_pair_file(str(path), es, et)
-    lines = path.read_text().split("\n")
+    lines = read_text(path).split("\n")
     assert lines[0].startswith(" ||| ") and lines[2] == " ||| " and lines[3] == ""
     if NATIVE.exists():
         subprocess.run(

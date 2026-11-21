@@ -12,6 +12,7 @@ use std::io::{BufWriter, Write};
 use std::path::Path;
 use std::time::Instant;
 
+use fastalign_core::cancel::Cancel;
 use fastalign_core::corpus::{Corpus, LoadOptions};
 use fastalign_core::oracle::TrainOptions;
 use fastalign_core::train::{train_both, ParallelOptions, Sinks};
@@ -90,6 +91,7 @@ fn main() {
             log: &mut re,
             out: &mut ro,
         },
+        &Cancel::default(),
     )
     .unwrap();
     for w in [&mut fo, &mut fe, &mut ro, &mut re] {

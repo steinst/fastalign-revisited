@@ -20,6 +20,11 @@ pub struct AlignOptions {
     pub tension: f64,
     /// Expected target length per source word (`-m`), used by the length score only.
     pub mean_srclen_multiplier: f64,
+    /// Without NULL, start the argmax as training's Viterbi decoding does (spec §8: any value
+    /// `> −1`, so a column of zeros links to the first source word) instead of as fast_align's
+    /// `-f` mode (§16: only values `> 0` link). Saved-model inference sets it so that it
+    /// reproduces the training run; `-f` keeps fast_align's rule.
+    pub training_argmax: bool,
 }
 
 /// Align one sentence pair. `first` and `second` are the two sides of the pair (word ids, as the
@@ -55,7 +60,7 @@ pub fn align_pair<P: Fn(u32, u32) -> f64>(
         let j32 = j as u32;
         let mut sum = 0.0f64;
         let mut best = 0usize;
-        let mut best_p = 0.0f64;
+        let mut best_p = if opts.training_argmax { -1.0 } else { 0.0f64 };
         let mut a = uniform;
         if opts.use_null {
             if opts.favor_diagonal {

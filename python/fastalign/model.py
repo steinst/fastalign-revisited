@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import math
 import os
+import warnings
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -110,6 +111,14 @@ def _check_threads(threads: int) -> int:
     return threads
 
 
+def _check_offset_cache(mb: int) -> int:
+    if isinstance(mb, bool) or not isinstance(mb, int) or mb < 0:
+        raise ValueError(
+            f"offset_cache_mb must be a non-negative integer (MiB; 0 = off), got {mb!r}"
+        )
+    return mb
+
+
 def _method(name: str | None) -> str | None:
     if name == "intersection":
         return "intersect"
@@ -138,7 +147,8 @@ class Model:
 
     def __init__(self, _inner: _core.Model) -> None:
         self._inner = _inner
-        self._segmenters: tuple[_sw.Segmenter, _sw.Segmenter] | None = None
+        # the stored tokenisers, built on first use: None = not looked at yet, () = none
+        self._segmenters: tuple[_sw.Segmenter, _sw.Segmenter] | tuple[()] | None = None
 
     # -- introspection ------------------------------------------------------------------
 
@@ -163,6 +173,13 @@ class Model:
         return self._inner.n_lines
 
     @property
+    def training_warnings(self) -> list[str]:
+        """What :func:`train` warned about (also issued as :class:`RuntimeWarning`): no line pair
+        to train on, or a direction whose parameters ended nonfinite (with the line pairs with
+        an empty side that explain it). Empty for a loaded model or a clean run."""
+        return self._inner.training_warnings
+
+    @property
     def subword(self) -> dict | None:
         """How this model segments words, or ``None`` for a word-level model: ``marker`` and
         ``kind`` (``"start"``: a piece beginning with the marker begins a word; ``"continue"``:
@@ -171,33 +188,28 @@ class Model:
         info = self._inner.subword
         if info is None:
             return None
-        kind, marker, blobs, settings = info
+        kind, marker, _blobs, settings = info
         return {
             "kind": kind,
             "marker": marker,
-            "tokenizer": bool(blobs) and any(blobs),
+            "tokenizer": self._inner.has_tokenizer,
             "settings": _sw.read_settings(settings) if settings else None,
         }
 
     def _text_segmenters(self) -> tuple[_sw.Segmenter, _sw.Segmenter] | None:
-        """The stored tokenisers (built once), or ``None`` if text is not segmented here."""
-        info = self._inner.subword
-        if info is None or not info[2] or not any(info[2]):
-            return None
-        if self._segmenters is None:
-            settings = _sw.read_settings(info[3])
-            self._segmenters = _sw.make_segmenters(info[2], settings["layout"])
-        return self._segmenters
-
-    def _segment(self, src: TextSource, tgt: TextSource | None):
-        """Cut new text into pieces with the stored tokeniser (as two lists of lines)."""
-        segs = self._text_segmenters()
-        assert segs is not None
-        a, b = _sw.corpus_sides(src, tgt)
-        return (
-            [_sw.encode_line(w, segs[0]) for w in a()],
-            [_sw.encode_line(w, segs[1]) for w in b()],
-        )
+        """The stored tokenisers, or ``None`` if text is not segmented here. Built once: the
+        tokeniser blobs are fetched from the model on the first call only. Their word caches are
+        bounded; each ``align_many`` call encodes with its own
+        :func:`~fastalign.subword.scoped_segmenters` copies."""
+        segs = self._segmenters
+        if segs is None:
+            segs = ()
+            if self._inner.has_tokenizer:
+                info = self._inner.subword
+                layout = _sw.read_settings(info[3])["layout"]
+                segs = _sw.make_segmenters(info[2], layout, _sw.MODEL_CACHE_WORDS)
+            self._segmenters = segs  # a race builds it twice, harmlessly
+        return segs or None
 
     def parameters(self, direction: str = "fwd") -> dict[str, float | int]:
         """Final parameters of one direction: ``tension``, ``p0``, ``iterations`` and
@@ -235,7 +247,24 @@ class Model:
             ValueError: the file is not a fastalign model, is truncated or corrupt, or has an
                 unsupported format version.
         """
-        return cls(_core.Model.load(os.fspath(path)))
+        model = cls(_core.Model.load(os.fspath(path)))
+        model._check_usable()
+        return model
+
+    def _check_usable(self) -> None:
+        """A model read from a file must serve inference: a direction, and tokeniser settings
+        that agree with the stored tokenisers (the core also reads directionless results)."""
+        if not self.directions:
+            raise ValueError("the model file holds neither direction, so it cannot align")
+        info = self._inner.subword
+        if info is None or not info[2]:
+            return
+        blobs = info[2]
+        layout = _sw.read_settings(info[3])["layout"] if info[3] else None
+        if layout is None or len(blobs) != (1 if layout == "joint" else 2):
+            raise ValueError("the model's tokeniser settings are inconsistent")
+        if layout == "joint" and not blobs[0]:
+            raise ValueError("the model's tokeniser settings are inconsistent")
 
     def write_table(
         self,
@@ -249,8 +278,11 @@ class Model:
 
         Args:
             direction: ``"fwd"`` or ``"inv"``; default the first direction of the model.
-            beam_threshold: fast_align's ``-t``: only entries whose log probability is at least
-                this are written.
+            beam_threshold: fast_align's ``-t``, relative to each row: an entry is written when
+                its probability is at least ``max ** -beam_threshold``, where ``max`` is the
+                largest probability in its source word's row (equivalently its log probability
+                is at least ``-beam_threshold`` times the row maximum's log probability).
+                With the default ``-4`` that is ``max ** 4``. It is not an absolute cutoff.
             threads: Worker threads, 0 for all cores.
         """
         d = direction if direction is not None else self.directions[0]
@@ -328,20 +360,20 @@ class Model:
             symmetrize, direction: As for :meth:`alignments`.
 
         Words that were not in the training data, and word pairs the table has no entry for,
-        get fast_align's probability of 1e-9 (as in its ``-f`` mode). Each call looks up the
-        model's vocabulary afresh; to align many sentences use :meth:`align_many`.
+        get fast_align's probability of 1e-9 (as in its ``-f`` mode). The result is what
+        :meth:`align_many` gives for a one-line input; the pair is aligned directly on the calling
+        thread with the model's word index (built on the first call and kept), so a call costs
+        about as much per pair as a batch. Use :meth:`align_many` for files, scores and threads.
 
         A model trained with a ``subword`` tokeniser cuts the words into pieces, aligns the
         pieces and returns links between *words* (positions in ``src`` and ``tgt``).
         """
-        return self.align_many(
-            [sentence_to_line(src, "src")],
-            [sentence_to_line(tgt, "tgt")],
-            symmetrize,
-            direction,
-            0,
-            False,
-        )[0]
+        s, t = sentence_to_line(src, "src"), sentence_to_line(tgt, "tgt")
+        segs = self._text_segmenters()
+        if segs is not None:
+            s = _sw.encode_line(s.encode("utf-8").split(), segs[0])
+            t = _sw.encode_line(t.encode("utf-8").split(), segs[1])
+        return self._inner.align_pair(s, t, _method(symmetrize), direction)
 
     def align_many(
         self,
@@ -360,8 +392,10 @@ class Model:
                 ``source ||| target`` lines.
             symmetrize, direction: As for :meth:`alignments`.
             threads: Worker threads, 0 for all cores.
-            scores: Append ``||| score`` (log probability of the best alignment) to every line
-                of the written text; needs ``direction``. The links you read from the result
+            scores: Append ``||| score`` to every line of the written text; needs ``direction``.
+                The score is the log probability of the pair under the model summed over all
+                alignments (length term plus the log of each target word's sum over source
+                positions), not the best alignment's probability. The links you read from the result
                 are the same.
 
         With ``scores=True`` and ``result.write(path)`` the output equals that of
@@ -373,15 +407,16 @@ class Model:
         between words. A model trained on pre-segmented text (:class:`PreSegmented`) expects
         text segmented in the same way.
         """
-        if self._text_segmenters() is not None:
-            segmented = self._segment(src, tgt)
-            return self._inner.align_many(
-                segmented[0],
-                segmented[1],
-                _method(symmetrize),
+        segs = self._text_segmenters()
+        if segs is not None:
+            return self._align_segmented(
+                _sw.scoped_segmenters(segs, _sw.INFERENCE_CACHE_WORDS),
+                src,
+                tgt,
+                symmetrize,
                 direction,
-                _check_threads(threads),
-                bool(scores),
+                threads,
+                scores,
             )
         return self._inner.align_many(
             text_source(src, "src"),
@@ -391,6 +426,36 @@ class Model:
             _check_threads(threads),
             bool(scores),
         )
+
+    def _align_segmented(self, segs, src, tgt, symmetrize, direction, threads, scores):
+        """:meth:`align_many` of plain words with the stored tokeniser. Sentences held in memory
+        are cut into pieces in memory; files (and standard input) are streamed through two
+        temporary piece files, so neither the words nor the pieces are held in Python."""
+        import tempfile
+
+        from fastalign._input import StdinText
+
+        opts = (_method(symmetrize), direction, _check_threads(threads), bool(scores))
+
+        def args(a, b):
+            return (a, b, *opts)
+
+        def in_memory(x) -> bool:
+            return not isinstance(x, (str, os.PathLike, StdinText, bytes, bytearray))
+
+        if tgt is not None and in_memory(src) and in_memory(tgt):
+            a, b = _sw.corpus_sides(src, tgt)
+            return self._inner.align_many(
+                *args(
+                    [_sw.encode_line(w, segs[0]) for w in a()],
+                    [_sw.encode_line(w, segs[1]) for w in b()],
+                )
+            )
+        with tempfile.TemporaryDirectory(prefix="fastalign-pieces-") as tmp:
+            sides = _sw.corpus_sides(src, tgt, tmp)
+            paths = (os.path.join(tmp, "pieces.src"), os.path.join(tmp, "pieces.tgt"))
+            _sw.write_piece_sides(sides, segs, paths)
+            return self._inner.align_many(*args(*paths))
 
 
 def _opt_float(name: str, v: float) -> float:
@@ -415,11 +480,16 @@ def train(
     null: bool = True,
     buffer_size: int = 10000,
     max_len: int | None = None,
+    empty_pairs: str = "keep",
     scores: bool = False,
     callback: Callable[[Progress], None] | None = None,
     lookup_index: bool = True,
+    offset_cache_mb: int = 0,
     subword: str | SubwordConfig | PreSegmented | None = None,
     subword_output: bool = False,
+    _outputs_only: bool = False,
+    _table_files: dict[str, str] | None = None,
+    _table_beam: float = -4.0,
 ) -> Model:
     """Train fast_align's reparameterised IBM Model 2 on a parallel corpus.
 
@@ -431,7 +501,9 @@ def train(
         src, tgt: The two sides of the corpus: paths of line-aligned text files, or lists of
             sentences (each a string split on whitespace, or a list of tokens) of equal length.
             With ``tgt`` omitted, ``src`` is the path of one file of ``source ||| target``
-            lines (fast_align's format). A plain ``str`` is always a file path.
+            lines (fast_align's format: a tab also separates the sides). With two files each
+            file is one side (a tab or ``|||`` in a line stays on its side). A plain ``str`` is
+            always a file path; pipes and FIFOs are read to the end.
         threads: Worker threads; 0 uses all cores.
         directions: ``"both"``, ``"fwd"`` (source generates target) or ``"inv"`` (fast_align's
             ``-r``). Symmetrising needs both.
@@ -447,8 +519,18 @@ def train(
             grouped, exactly as in fast_align.
         max_len: Skip lines with more tokens than this on either side. Off by default:
             dropping lines changes the result relative to fast_align on the unfiltered file.
-        scores: Append ``||| score`` (log probability of the best alignment, ``-s``) to the
-            lines of each direction's alignments.
+        empty_pairs: Line pairs with an empty side (one side has no word, or a blank line).
+            ``"keep"`` (default) trains on them as fast_align does, which changes the *other*
+            pairs' results: an empty source side makes the forward direction's mean length
+            ratio infinite and, with ``optimize_tension``, its tension NaN, so that direction
+            aligns no line at all; a blank line makes the ratio NaN and every score NaN.
+            ``"skip"`` drops them before training (their output lines are empty, so positions
+            are kept; ids and results are those of the file without them). ``"error"`` raises
+            ``ValueError`` with their line numbers, sides and counts.
+        scores: Append ``||| score`` (``-s``) to the lines of each direction's alignments. The
+            score is the log probability of the pair under the model, summed over *all*
+            alignments: the length term plus, for each target word, the log of the sum over
+            source positions (and NULL). The best alignment only chooses the printed links.
         callback: Called with a :class:`Progress` after every iteration of each direction
             (from a worker thread; the directions train one after the other). An exception raised by
             it stops training and propagates. Progress is also logged to the ``fastalign``
@@ -456,9 +538,15 @@ def train(
         lookup_index: Build a dense lookup index of the busiest table rows (64 MB per
             direction) for a faster E-step and M-step. ``False`` saves the memory; output is
             the same.
+        offset_cache_mb: MiB per direction for the opt-in cell-offset cache (0, the default,
+            turns it off). The first E-step stores the table cell of every word pair of each
+            line that fits the budget, in corpus order; later E-steps and decoding read the
+            probabilities through them instead of searching the table. On en-fr large (1.1M
+            lines) every line needs about 1.7 GB per direction and the run is 20-25 % faster;
+            smaller budgets give proportionally less. Output is the same.
         subword: Align subword pieces and report word links. ``None`` (default): words, nothing
             changes. ``"auto"`` or a :class:`SubwordConfig`: train a SentencePiece tokeniser on
-            the corpus (needs ``pip install 'fastalign[subword]'``; the defaults are BPE, one
+            the corpus (needs ``pip install 'fastalign-revisited[subword]'`` (from a checkout: ``pip install '.[subword]'``); the defaults are BPE, one
             joint model of 8000 pieces), cut every word into pieces, train on the pieces, and
             project the piece links to words; the tokeniser is stored in the model, so
             :meth:`Model.align_many` segments new text the same way. A :class:`PreSegmented`:
@@ -471,12 +559,29 @@ def train(
         The trained :class:`Model`, which also holds the alignments of the training corpus.
 
     Raises:
-        ValueError: bad arguments (mismatched corpus sizes, a token with whitespace, an empty
-            corpus, ...).
+        ValueError: bad arguments (mismatched corpus sizes, a token with whitespace, a tension
+            too close to 0 for the diagonal prior, empty pairs with ``empty_pairs="error"``,
+            ...).
+
+    Warns:
+        RuntimeWarning: the corpus has no line pair to train on (an empty input, or every line
+            dropped by ``max_len``/``empty_pairs="skip"``; training still succeeds, with one
+            empty alignment line per input line), or a direction's parameters ended nonfinite
+            (see ``empty_pairs``). :attr:`Model.training_warnings` keeps the messages.
+
+    With ``iterations=0`` nothing is decoded (fast_align's ``-I 0``): the alignments have no
+    lines at all, whatever ``max_len`` or ``subword`` say. With ``iterations=1`` the model has
+    no estimated probabilities (its exported table is all ``-inf``, as fast_align's); aligning
+    with it reproduces the training alignments, which come from the alignment prior alone.
         FileNotFoundError, OSError: unreadable input files.
         KeyboardInterrupt: Ctrl-C. Training stops within a fraction of a second.
 
     The GIL is released for the whole run, so other Python threads keep running.
+
+    (The underscore-prefixed arguments are for the ``fastalign train`` command: it writes files
+    only, so each direction's tables are written, and dropped, as soon as that direction has
+    finished. A model trained that way holds the training alignments and logs but cannot be
+    saved or used to align.)
     """
     if directions not in ("both", "fwd", "inv"):
         raise ValueError(f"directions must be 'both', 'fwd' or 'inv', not {directions!r}")
@@ -484,6 +589,7 @@ def train(
         raise ValueError(f"iterations must be a non-negative integer, got {iterations!r}")
     if isinstance(buffer_size, bool) or not isinstance(buffer_size, int) or buffer_size < 0:
         raise ValueError(f"buffer_size must be a non-negative integer, got {buffer_size!r}")
+    _check_offset_cache(offset_cache_mb)
     if max_len is not None and (
         isinstance(max_len, bool) or not isinstance(max_len, int) or max_len < 1
     ):
@@ -499,6 +605,8 @@ def train(
         raise ValueError("tension needs diagonal=True")
     if not 0.0 <= p0 < 1.0:
         raise ValueError(f"p0 must be in [0, 1), got {p0!r}")
+    if empty_pairs not in ("keep", "skip", "error"):
+        raise ValueError(f"empty_pairs must be 'keep', 'skip' or 'error', not {empty_pairs!r}")
     if callback is not None and not callable(callback):
         raise TypeError("callback must be callable")
 
@@ -539,11 +647,16 @@ def train(
             bool(null),
             buffer_size,
             max_len,
+            empty_pairs,
             bool(scores),
             on_progress,
             bool(lookup_index),
             subword_arg,
             bool(subword_output),
+            not _outputs_only,
+            None if not _table_files else [(d, os.fspath(p)) for d, p in _table_files.items()],
+            float(_table_beam),
+            offset_cache_mb=offset_cache_mb,
         )
 
     if sub is None:
@@ -556,6 +669,8 @@ def train(
         )
     else:
         inner = _train_with_tokenizer(run, src, tgt, sub)
+    for message in inner.training_warnings:
+        warnings.warn(message, RuntimeWarning, stacklevel=2)
     return Model(inner)
 
 
@@ -564,9 +679,10 @@ def _train_with_tokenizer(run, src, tgt, config: SubwordConfig):
     train on it and attach the tokeniser to the model."""
     import tempfile
 
-    sides = _sw.corpus_sides(src, tgt)
-    sa, sb, blobs, layout = _sw.train_stream_segmenters(sides, config)
     with tempfile.TemporaryDirectory(prefix="fastalign-subword-") as tmp:
+        # read twice (tokeniser training, then encoding): a pipe is spooled to `tmp` once
+        sides = _sw.corpus_sides(src, tgt, tmp)
+        sa, sb, blobs, layout = _sw.train_stream_segmenters(sides, config)
         path = os.path.join(tmp, "pieces.txt")
         _sw.write_piece_corpus(path, sides, (sa, sb))
         return run(
@@ -642,14 +758,17 @@ def symmetrize_many(
     fwd: Sequence[Sequence[Link]],
     inv: Sequence[Sequence[Link]],
     method: str = "grow-diag-final-and",
+    threads: int = 0,
 ) -> list[list[Link]]:
-    """Symmetrise many sentence pairs in parallel; see :func:`symmetrize`."""
+    """Symmetrise many sentence pairs, in parallel batches on ``threads`` workers (0 for all
+    cores); the result does not depend on ``threads``. See :func:`symmetrize`."""
     if len(fwd) != len(inv):
         raise ValueError(f"fwd and inv must have the same size ({len(fwd)} and {len(inv)})")
     return _core.symmetrize_many(
         [list(map(tuple, f)) for f in fwd],
         [list(map(tuple, i)) for i in inv],
         _method(method),
+        _check_threads(threads),
     )
 
 
@@ -660,5 +779,5 @@ def invert(links: Sequence[Link]) -> list[Link]:
 
 def parse_pharaoh(line: str) -> list[Link]:
     """Parse a Pharaoh alignment line such as ``"0-0 1-2"`` into links (a ``||| score``
-    suffix is ignored)."""
+    suffix or atools prefix is ignored; sorted, no duplicates)."""
     return _core.parse_pharaoh(line)

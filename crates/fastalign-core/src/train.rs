@@ -44,10 +44,13 @@ use std::time::{Duration, Instant};
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 
-use crate::corpus::{Corpus, Side, Vocab, NULL_ID};
+use crate::cancel::Cancel;
+use crate::corpus::{part_ranges, Corpus, Side, Vocab, MAX_PART_ENTRIES, NULL_ID};
 use crate::math::{self, G};
 use crate::oracle::{IterationStats, TrainOptions, UNINITIALISED_PROB};
-use crate::ttable::{initial_pass, InitialPass, RowOrder, TTable, TableOptions};
+use crate::ttable::{
+    initial_pass_with, InitialPass, RowOrder, TTable, TableOptions, CANCEL_STRIDE,
+};
 
 /// `ln 2`, as GCC folds `log(2)` (spec §10.1).
 const LN_2: f64 = std::f64::consts::LN_2;
@@ -78,6 +81,18 @@ pub struct ParallelOptions {
     /// target id, ≈ 0.25 B per cell) that narrows their search to one 16-key block
     /// (PERF-TODO 2c). `usize::MAX` disables it.
     pub sample_min_row_len: usize,
+    /// Most `f64` cells of one worker's per-line probability matrix (one cell per distinct
+    /// source × distinct target word of a line). A line needing more is served column by
+    /// column from a cache of this many cells, filled by direct table lookups (review
+    /// performance item 8); the values, and so every output bit, are the same.
+    pub line_cells: usize,
+    /// Bytes of the opt-in cell-offset cache (review performance item 6), per direction; 0
+    /// (the default) disables it. The first E-step after the first M-step stores, for the
+    /// lines that fit the budget (in corpus order), the table cell of every distinct word pair
+    /// it looks up; later E-steps and decoding read the probabilities through those offsets
+    /// instead of searching the table. Lines served column by column (see `line_cells`) are
+    /// not cached. The cell offsets of a line never change, so neither does any value.
+    pub offset_cache_bytes: usize,
 }
 
 impl Default for ParallelOptions {
@@ -90,6 +105,8 @@ impl Default for ParallelOptions {
             dense_min_row_len: 1024,
             block_lines: 65536,
             sample_min_row_len: 64,
+            line_cells: 1 << 20,
+            offset_cache_bytes: 0,
         }
     }
 }
@@ -168,13 +185,16 @@ struct LengthPairs {
 }
 
 impl LengthPairs {
-    fn build(src: &Side, trg: &Side, budget: usize) -> Self {
+    fn build(src: &Side, trg: &Side, budget: usize, cancel: &Cancel) -> Self {
         let n_lines = src.offsets().len() - 1;
         let mut index: FxHashMap<(u32, u32), u32> = FxHashMap::default();
         let mut pairs = Vec::new();
         let mut counts: Vec<u64> = Vec::new();
         let mut line_pair = Vec::with_capacity(n_lines);
         for k in 0..n_lines {
+            if k % CANCEL_STRIDE == 0 {
+                cancel.check();
+            }
             let key = (trg.line_len(k) as u32, src.line_len(k) as u32);
             let p = *index.entry(key).or_insert_with(|| {
                 pairs.push(key);
@@ -238,21 +258,36 @@ struct RowPart {
 }
 
 impl RowLines {
-    fn build(src: &Side, trg: &Side, n_rows: usize, use_null: bool) -> Self {
+    fn build(src: &Side, trg: &Side, n_rows: usize, use_null: bool, cancel: &Cancel) -> Self {
+        Self::build_with(src, trg, n_rows, use_null, MAX_PART_ENTRIES, cancel)
+    }
+
+    /// `max_entries` bounds every part's entries (its `u32` offsets; at most one per source
+    /// token); tests lower it.
+    fn build_with(
+        src: &Side,
+        trg: &Side,
+        n_rows: usize,
+        use_null: bool,
+        max_entries: usize,
+        cancel: &Cancel,
+    ) -> Self {
         let n_lines = src.offsets().len() - 1;
         let n_parts = rayon::current_num_threads().clamp(1, n_lines.max(1));
         let null = NULL_ID as usize;
         // Per part: local CSR (start, lines), cost per row, whether `<eps>` is a source word.
         type PartOut = (RowPart, Vec<u64>, bool);
-        let built: Vec<PartOut> = (0..n_parts)
+        let built: Vec<PartOut> = part_ranges(src, n_parts, max_entries)
             .into_par_iter()
-            .map(|p| {
-                let lines = n_lines * p / n_parts..n_lines * (p + 1) / n_parts;
+            .map(|lines| {
                 let mut start = vec![0u32; n_rows + 1];
                 let mut cost = vec![0u64; n_rows];
                 let mut stamp = vec![u32::MAX; n_rows];
                 let mut eps = false;
                 for k in lines.clone() {
+                    if k % CANCEL_STRIDE == 0 {
+                        cancel.check();
+                    }
                     let m = trg.line_len(k) as u64;
                     if use_null && n_rows > null {
                         cost[null] += m;
@@ -277,6 +312,9 @@ impl RowLines {
                 let mut first = vec![0u16; start[n_rows] as usize];
                 stamp.fill(u32::MAX);
                 for k in lines {
+                    if k % CANCEL_STRIDE == 0 {
+                        cancel.check();
+                    }
                     for (i, &e) in src.line(k).iter().enumerate() {
                         let e = e as usize;
                         if use_null && e == null {
@@ -440,7 +478,7 @@ const SAMPLE: usize = 16;
 /// the binary search would: keys are unique and sorted, and every searched key is present.
 struct SampledRows {
     /// Range of every row's samples in `keys` (empty: plain binary search).
-    start: Vec<u32>,
+    start: Vec<usize>,
     keys: Vec<u32>,
 }
 
@@ -448,14 +486,14 @@ impl SampledRows {
     fn build(table: &TTable, dense: &DenseRows, min_len: usize) -> Self {
         let n_rows = table.n_rows();
         let mut start = Vec::with_capacity(n_rows + 1);
-        start.push(0u32);
+        start.push(0usize);
         let mut total = 0usize;
         for e in 0..n_rows as u32 {
             let len = table.row(e).len();
             if len >= min_len && dense.row(e).is_none() {
                 total += len.div_ceil(SAMPLE);
             }
-            start.push(u32::try_from(total).expect("sample index fits u32"));
+            start.push(total);
         }
         let cols = table.cols();
         let mut keys = Vec::with_capacity(total);
@@ -470,7 +508,7 @@ impl SampledRows {
     /// Samples of row `e` (empty: the row is searched by plain binary search).
     #[inline]
     fn samples(&self, e: u32) -> &[u32] {
-        &self.keys[self.start[e as usize] as usize..self.start[e as usize + 1] as usize]
+        &self.keys[self.start[e as usize]..self.start[e as usize + 1]]
     }
 
     /// Start of the block of `f` in its row, from the row's non-empty `samples`: the last
@@ -495,7 +533,7 @@ impl SampledRows {
     }
 
     fn memory_bytes(&self) -> usize {
-        self.start.capacity() * 4 + self.keys.capacity() * 4
+        self.start.capacity() * 8 + self.keys.capacity() * 4
     }
 }
 
@@ -528,6 +566,12 @@ impl LinePrior<'_> {
 /// Translation probabilities of one line, with each distinct `(e, f)` pair of the line looked
 /// up in the table once (a third of a line's cells repeat a pair, PERF-TODO 1). The values are
 /// copies of the table's `f64`s, so every product formed from them is unchanged.
+///
+/// The matrix of a line holds at most `cap` cells. A longer line (many distinct words on both
+/// sides) holds a tile of whole target columns instead: when a target position's column is not
+/// in the tile, the tile is replaced by the columns of the next distinct targets the line needs
+/// from that position on. The column values, and the order in which a column is summed, are
+/// the same either way.
 struct LineLookup {
     /// Distinct-source index of every source position.
     src_d: Vec<u32>,
@@ -535,11 +579,24 @@ struct LineLookup {
     trg_d: Vec<u32>,
     src_words: Vec<u32>,
     trg_words: Vec<u32>,
-    /// `mat[dt * n_ds + ds]` = `prob(src_words[ds], trg_words[dt])`.
+    /// Full mode: `mat[dt * n_ds + ds]` = `prob(src_words[ds], trg_words[dt])`. Column mode:
+    /// `mat[slot * n_ds + ds]` for the target held in `slot`.
     mat: Vec<f64>,
     /// `prob(NULL, trg_words[dt])`.
     null: Vec<f64>,
     n_ds: usize,
+    /// Most cells of `mat`.
+    cap: usize,
+    /// Column mode for this line.
+    columns: bool,
+    /// Column mode: the slot holding each distinct target, or [`NO_SLOT`].
+    slot_of: Vec<u32>,
+    /// Column mode: the distinct targets held by the slots, in slot order.
+    owner: Vec<u32>,
+    /// Column mode: number of column slots.
+    slots: usize,
+    /// Column mode: the target words of the tile being loaded.
+    keys: Vec<u32>,
     /// Vocabulary-sized stamps and slots for finding the distinct words.
     mark: Vec<u32>,
     slot: Vec<u32>,
@@ -547,6 +604,8 @@ struct LineLookup {
     /// Row offsets found by [`search_all`].
     hit: Vec<u32>,
 }
+
+const NO_SLOT: u32 = u32::MAX;
 
 /// Hint the CPU to load the cache line of `x` (no effect on any value).
 #[inline(always)]
@@ -614,8 +673,135 @@ fn search_all(
     }
 }
 
+/// The opt-in cell-offset cache ([`ParallelOptions::offset_cache_bytes`]): for lines
+/// `0..covered()`, the table cell of every distinct pair `LineLookup::prepare` looks up, in its
+/// matrix order followed by the NULL row's cells.
+struct OffsetCache {
+    /// Line `l`'s entries are `off[start[l]..start[l + 1]]` (none for a column-mode line).
+    start: Vec<u64>,
+    off: Vec<u32>,
+    /// Set once an E-step has stored every covered line's offsets.
+    filled: bool,
+    /// Distinct pairs looked up per pass over the corpus, and how many of them are cached.
+    pairs_total: u64,
+    pairs_cached: u64,
+}
+
+impl OffsetCache {
+    /// The cache for the longest prefix of lines whose entries (4 B each, plus 8 B per line)
+    /// fit `budget` bytes; `None` if nothing fits or cell offsets do not fit `u32`.
+    #[allow(clippy::too_many_arguments)]
+    fn build(
+        src: &Side,
+        trg: &Side,
+        n_vocab: usize,
+        use_null: bool,
+        line_cells: usize,
+        n_cells: usize,
+        budget: usize,
+        cancel: &Cancel,
+    ) -> Option<Self> {
+        if budget == 0 || n_cells > u32::MAX as usize {
+            return None;
+        }
+        let n = src.offsets().len() - 1;
+        let cap = line_cells.max(1);
+        let marks: Mutex<Vec<(Vec<u32>, u32)>> = Mutex::new(Vec::new());
+        // (entries if cached, distinct pairs) per line.
+        let per_line: Vec<(u64, u64)> = (0..n)
+            .into_par_iter()
+            .with_min_len(4096)
+            .map_init(
+                || marks.lock().unwrap().pop().unwrap_or((vec![0; n_vocab], 0)),
+                |(mark, stamp), l| {
+                    if l % CANCEL_STRIDE == 0 {
+                        cancel.check();
+                    }
+                    let mut distinct = |words: &[u32]| {
+                        if *stamp == u32::MAX {
+                            mark.fill(0);
+                            *stamp = 0;
+                        }
+                        *stamp += 1;
+                        let mut k = 0usize;
+                        for &w in words {
+                            if mark[w as usize] != *stamp {
+                                mark[w as usize] = *stamp;
+                                k += 1;
+                            }
+                        }
+                        k
+                    };
+                    let n_ds = distinct(src.line(l));
+                    let n_dt = distinct(trg.line(l));
+                    let null = if use_null { n_dt } else { 0 };
+                    let pairs = (n_ds * n_dt + null) as u64;
+                    let cached = if n_ds.saturating_mul(n_dt) > cap {
+                        0
+                    } else {
+                        pairs
+                    };
+                    (cached, pairs)
+                },
+            )
+            .collect();
+        let mut start = vec![0u64];
+        let mut bytes = 8usize;
+        let mut pairs_cached = 0;
+        for &(c, _) in &per_line {
+            let need = 8 + 4 * c as usize;
+            if bytes + need > budget {
+                break;
+            }
+            bytes += need;
+            pairs_cached += c;
+            start.push(start.last().unwrap() + c);
+        }
+        if start.len() == 1 {
+            return None;
+        }
+        Some(OffsetCache {
+            off: vec![0; *start.last().unwrap() as usize],
+            start,
+            filled: false,
+            pairs_total: per_line.iter().map(|x| x.1).sum(),
+            pairs_cached,
+        })
+    }
+
+    fn covered(&self) -> usize {
+        self.start.len() - 1
+    }
+
+    fn range(&self, line: usize) -> Range<usize> {
+        self.start[line] as usize..self.start[line + 1] as usize
+    }
+
+    fn line(&self, line: usize) -> Cached<'_> {
+        if line < self.covered() {
+            Cached::Use(&self.off[self.range(line)])
+        } else {
+            Cached::No
+        }
+    }
+
+    fn memory_bytes(&self) -> usize {
+        self.start.capacity() * 8 + self.off.capacity() * 4
+    }
+}
+
+/// A line's part of the [`OffsetCache`] in [`LineLookup::prepare`].
+enum Cached<'a> {
+    /// Not cached: look every pair up.
+    No,
+    /// Look every pair up and store its cell offset here (`mat` order, then the NULL row's).
+    Fill(&'a mut [u32]),
+    /// Read the probabilities at these cell offsets.
+    Use(&'a [u32]),
+}
+
 impl LineLookup {
-    fn new(n_vocab: usize) -> Self {
+    fn new(n_vocab: usize, cap: usize) -> Self {
         LineLookup {
             src_d: Vec::new(),
             trg_d: Vec::new(),
@@ -624,6 +810,12 @@ impl LineLookup {
             mat: Vec::new(),
             null: Vec::new(),
             n_ds: 0,
+            cap: cap.max(1),
+            columns: false,
+            slot_of: Vec::new(),
+            owner: Vec::new(),
+            slots: 0,
+            keys: Vec::new(),
             mark: vec![0; n_vocab],
             slot: vec![0; n_vocab],
             stamp: 0,
@@ -651,7 +843,7 @@ impl LineLookup {
         }
     }
 
-    fn prepare(&mut self, ctx: &Ctx, src: &[u32], trg: &[u32]) {
+    fn prepare(&mut self, ctx: &Ctx, src: &[u32], trg: &[u32], cache: Cached) {
         if !ctx.init {
             // Every probability is the initial constant: one distinct pair.
             self.src_d.clear();
@@ -659,6 +851,7 @@ impl LineLookup {
             self.trg_d.clear();
             self.trg_d.resize(trg.len(), 0);
             self.n_ds = 1;
+            self.columns = false;
             self.mat.clear();
             self.mat.push(UNINITIALISED_PROB);
             self.null.clear();
@@ -675,20 +868,94 @@ impl LineLookup {
         self.distinct(trg, s + 1, false);
         let (n_ds, n_dt) = (self.src_words.len(), self.trg_words.len());
         self.n_ds = n_ds;
-        self.mat.clear();
-        self.mat.resize(n_ds * n_dt, 0.0);
         let cols = ctx.table.cols();
         let mut hit = std::mem::take(&mut self.hit);
-        for (ds, &e) in self.src_words.iter().enumerate() {
-            let r = ctx.table.row(e);
-            let prob = &ctx.prob[r.clone()];
-            if let Some(d) = ctx.dense.row(e) {
-                dense_all(d, prob, &self.trg_words, &mut hit);
-            } else {
-                search_all(ctx.sampled, e, &cols[r], prob, &self.trg_words, &mut hit);
+        self.mat.clear();
+        self.columns = n_ds.saturating_mul(n_dt) > self.cap;
+        if self.columns {
+            // At least one column, whatever the budget: a column is O(line length), as
+            // `probs` is.
+            self.slots = (self.cap / n_ds).clamp(1, n_dt);
+            self.mat.resize(self.slots * n_ds, 0.0);
+            self.slot_of.clear();
+            self.slot_of.resize(n_dt, NO_SLOT);
+            self.owner.clear();
+        } else if let Cached::Use(off) = cache {
+            // Every offset was stored by a `Fill` of this line: same words, same cells.
+            let n_null = if ctx.use_null { n_dt } else { 0 };
+            assert_eq!(off.len(), n_ds * n_dt + n_null, "offset cache out of step");
+            let (m_off, n_off) = off.split_at(n_ds * n_dt);
+            const AHEAD: usize = 8;
+            for &o in &m_off[..AHEAD.min(m_off.len())] {
+                prefetch(&ctx.prob[o as usize]);
             }
-            for (dt, &k) in hit.iter().enumerate() {
-                self.mat[dt * n_ds + ds] = prob[k as usize];
+            self.mat.extend(m_off.iter().enumerate().map(|(k, &o)| {
+                if let Some(&p) = m_off.get(k + AHEAD) {
+                    prefetch(&ctx.prob[p as usize]);
+                }
+                ctx.prob[o as usize]
+            }));
+            self.null.clear();
+            self.null
+                .extend(n_off.iter().map(|&o| ctx.prob[o as usize]));
+            self.hit = hit;
+            return;
+        } else {
+            let mut fill = match cache {
+                Cached::Fill(off) => Some(off),
+                _ => None,
+            };
+            self.mat.resize(n_ds * n_dt, 0.0);
+            for (ds, &e) in self.src_words.iter().enumerate() {
+                let r = ctx.table.row(e);
+                let prob = &ctx.prob[r.clone()];
+                if let Some(d) = ctx.dense.row(e) {
+                    dense_all(d, prob, &self.trg_words, &mut hit);
+                } else {
+                    search_all(
+                        ctx.sampled,
+                        e,
+                        &cols[r.clone()],
+                        prob,
+                        &self.trg_words,
+                        &mut hit,
+                    );
+                }
+                for (dt, &k) in hit.iter().enumerate() {
+                    self.mat[dt * n_ds + ds] = prob[k as usize];
+                }
+                if let Some(off) = fill.as_deref_mut() {
+                    for (dt, &k) in hit.iter().enumerate() {
+                        off[dt * n_ds + ds] = (r.start + k as usize) as u32;
+                    }
+                }
+            }
+            if let Some(off) = fill {
+                if ctx.use_null {
+                    let r = ctx.table.row(NULL_ID);
+                    let prob = &ctx.prob[r.clone()];
+                    self.null.clear();
+                    if let Some(d) = ctx.dense.row(NULL_ID) {
+                        dense_all(d, prob, &self.trg_words, &mut hit);
+                    } else {
+                        search_all(
+                            ctx.sampled,
+                            NULL_ID,
+                            &cols[r.clone()],
+                            prob,
+                            &self.trg_words,
+                            &mut hit,
+                        );
+                    }
+                    self.null.extend(hit.iter().map(|&k| prob[k as usize]));
+                    for (o, &k) in off[n_ds * n_dt..].iter_mut().zip(&hit) {
+                        *o = (r.start + k as usize) as u32;
+                    }
+                } else {
+                    self.null.clear();
+                }
+                self.hit = hit;
+                return;
             }
         }
         self.null.clear();
@@ -717,10 +984,64 @@ impl LineLookup {
         self.src_d.len()
     }
 
-    /// Offset of target position `j`'s column in `mat`.
+    /// Offset of target position `j`'s column in `mat` (in column mode, loaded first if it is
+    /// not cached).
     #[inline]
-    fn column(&self, j: usize) -> usize {
-        self.trg_d[j] as usize * self.n_ds
+    fn column(&mut self, ctx: &Ctx, j: usize) -> usize {
+        let dt = self.trg_d[j] as usize;
+        if !self.columns {
+            return dt * self.n_ds;
+        }
+        let s = self.slot_of[dt];
+        if s != NO_SLOT {
+            return s as usize * self.n_ds;
+        }
+        self.load_column(ctx, j)
+    }
+
+    /// Column mode: empty the cache and load a tile of columns, the distinct targets of
+    /// positions `j, j+1, …` in order of first use until every slot is taken. The tile is
+    /// filled row by row, as the full matrix is (each source row's lookups for all of the
+    /// tile's targets at once, so the row stays in cache). Returns the offset of `j`'s column.
+    #[cold]
+    fn load_column(&mut self, ctx: &Ctx, j: usize) -> usize {
+        for &dt in &self.owner {
+            if dt != NO_SLOT {
+                self.slot_of[dt as usize] = NO_SLOT;
+            }
+        }
+        self.owner.clear();
+        let slots = self.slots;
+        let mut keys = std::mem::take(&mut self.keys);
+        keys.clear();
+        for &dt in &self.trg_d[j..] {
+            if self.owner.len() == slots {
+                break;
+            }
+            if self.slot_of[dt as usize] == NO_SLOT {
+                self.slot_of[dt as usize] = self.owner.len() as u32;
+                self.owner.push(dt);
+                keys.push(self.trg_words[dt as usize]);
+            }
+        }
+        let n_ds = self.n_ds;
+        let cols = ctx.table.cols();
+        let mut hit = std::mem::take(&mut self.hit);
+        for (ds, &e) in self.src_words.iter().enumerate() {
+            let r = ctx.table.row(e);
+            let prob = &ctx.prob[r.clone()];
+            if let Some(d) = ctx.dense.row(e) {
+                dense_all(d, prob, &keys, &mut hit);
+            } else {
+                search_all(ctx.sampled, e, &cols[r], prob, &keys, &mut hit);
+            }
+            for (s, &k) in hit.iter().enumerate() {
+                self.mat[s * n_ds + ds] = prob[k as usize];
+            }
+        }
+        self.hit = hit;
+        self.keys = keys;
+        self.slot_of[self.trg_d[j] as usize] as usize * n_ds
     }
 
     /// `prob(src[i], trg[j])` for `col = column(j)` and 0-based source position `i`.
@@ -733,6 +1054,28 @@ impl LineLookup {
     #[inline]
     fn null(&self, j: usize) -> f64 {
         self.null[self.trg_d[j] as usize]
+    }
+}
+
+/// Per-task scratch of phase A and decoding (the column buffer and a [`LineLookup`], whose
+/// stamp arrays are vocabulary-sized), handed from finished tasks to new ones within one phase
+/// instead of being allocated per task (review performance item 7). A phase holds at most one
+/// per concurrently running task, as before, and frees them when it ends. No value depends on
+/// which scratch a task gets: `LineLookup::prepare` resets everything a line reads.
+#[derive(Default)]
+struct ScratchPool(Mutex<Vec<TaskScratch>>);
+
+/// One task's column buffer and line lookup.
+type TaskScratch = Box<(Vec<f64>, LineLookup)>;
+
+impl ScratchPool {
+    fn get(&self, n_vocab: usize, line_cells: usize) -> TaskScratch {
+        let reused = self.0.lock().unwrap().pop();
+        reused.unwrap_or_else(|| Box::new((Vec::new(), LineLookup::new(n_vocab, line_cells))))
+    }
+
+    fn put(&self, s: TaskScratch) {
+        self.0.lock().unwrap().push(s);
     }
 }
 
@@ -782,14 +1125,14 @@ impl Ctx<'_> {
     #[inline]
     fn column(
         &self,
-        lk: &LineLookup,
+        lk: &mut LineLookup,
         j: usize,
         uniform: f64,
         lp: Option<LinePrior<'_>>,
         probs: &mut [f64],
     ) -> f64 {
         let mut sum = 0.0f64;
-        let col = lk.column(j);
+        let col = lk.column(self, j);
         if self.use_null {
             let a = if self.diag { self.p0 } else { uniform };
             probs[0] = lk.null(j) * a;
@@ -825,10 +1168,11 @@ impl Ctx<'_> {
         part: &mut Partial,
         probs: &mut Vec<f64>,
         lk: &mut LineLookup,
+        cache: Cached,
     ) {
         let src = self.src.line(line);
         let trg = self.trg.line(line);
-        lk.prepare(self, src, trg);
+        lk.prepare(self, src, trg, cache);
         let (n, m) = (src.len(), trg.len());
         let (n32, m32) = (n as u32, m as u32);
         probs.clear();
@@ -859,10 +1203,11 @@ impl Ctx<'_> {
         out: &mut String,
         probs: &mut Vec<f64>,
         lk: &mut LineLookup,
+        cache: Cached,
     ) -> f64 {
         let src = self.src.line(line);
         let trg = self.trg.line(line);
-        lk.prepare(self, src, trg);
+        lk.prepare(self, src, trg, cache);
         let n = src.len();
         probs.clear();
         probs.resize(n + 1, 0.0);
@@ -978,6 +1323,200 @@ enum BlockProb<'a> {
     Part(&'a [f64]),
 }
 
+/// A blocked phase-B job of a [`Schedule`].
+#[derive(Clone, Copy)]
+enum Spec {
+    /// Whole row `e`, adding into the `cnt`-th block count buffer.
+    Whole { e: u32, cnt: u32 },
+    /// Part number `p` (see [`Schedule::parts`]).
+    Part { p: u32 },
+}
+
+/// In [`Schedule::jobs`], marks a part number; other codes are whole rows.
+const PART: u32 = 1 << 31;
+
+/// Phase B's work plan: which rows are split and where, which rows are walked in line blocks,
+/// the job order and the chunks workers claim. It depends only on the table structure, the
+/// per-row costs, the target frequencies, the options and the thread count, none of which
+/// change between iterations, so it is built once per thread count (review performance item
+/// 7). Like every other scheduling choice, it changes no value.
+struct Schedule {
+    threads: usize,
+    /// Split rows in row order: row, offset of its counts in the split buffer, part
+    /// boundaries (row-local cell indices, from 0 to the row length).
+    split: Vec<(u32, usize, Vec<usize>)>,
+    split_len: usize,
+    /// Line block size of the blocked jobs (0 disables blocking).
+    block_lines: usize,
+    /// Blocked whole rows in row order (their count buffers, numbered in this order).
+    block_rows: Vec<u32>,
+    block_len: usize,
+    /// Parts of the split rows, numbered in row then cell order (their count buffers are
+    /// numbered the same way): split row index, first row-local cell.
+    parts: Vec<(u32, u32)>,
+    /// Blocked jobs, largest first.
+    bjobs: Vec<Spec>,
+    /// The other jobs, largest first: a whole row `e`, or `PART | p`. Four bytes per job, so
+    /// keeping the plan between iterations costs next to nothing.
+    jobs: Vec<u32>,
+    /// Boundaries in `jobs` of the chunks a worker claims at once.
+    chunks: Vec<usize>,
+}
+
+impl Schedule {
+    fn build(
+        table: &TTable,
+        cost: &[u64],
+        target_freq: &[u32],
+        dense: &DenseRows,
+        popts: &ParallelOptions,
+        threads: usize,
+    ) -> Self {
+        let total: u64 = cost.iter().sum();
+        let split_cost = popts.split_cost.unwrap_or(if threads > 1 {
+            (total / (2 * threads as u64)).max(1 << 14)
+        } else {
+            u64::MAX
+        });
+        let n_rows = table.n_rows();
+        let cols = table.cols();
+        let mut split: Vec<(u32, usize, Vec<usize>)> = Vec::new();
+        let mut split_len = 0;
+        for e in 0..n_rows as u32 {
+            let r = table.row(e);
+            let c = cost[e as usize];
+            if r.len() < 2 || c <= split_cost {
+                continue;
+            }
+            let parts = (c.div_ceil(split_cost) as usize).min(r.len()).min(256);
+            if parts < 2 {
+                continue;
+            }
+            let w: Vec<u64> = cols[r.clone()]
+                .iter()
+                .map(|&f| u64::from(target_freq[f as usize]).max(1))
+                .collect();
+            let tot: u64 = w.iter().sum();
+            let mut cuts = vec![0usize];
+            let mut acc = 0u64;
+            for (k, &x) in w.iter().enumerate() {
+                acc += x;
+                let q = cuts.len() as u64;
+                if acc * parts as u64 >= q * tot && k + 1 < r.len() && cuts.len() < parts {
+                    cuts.push(k + 1);
+                }
+            }
+            cuts.push(r.len());
+            cuts.dedup();
+            if cuts.len() > 2 {
+                split.push((e, split_len, cuts));
+                split_len += r.len();
+            }
+        }
+        // Rows walked in line blocks (PERF-TODO 9): those with a dense index. One thread has
+        // no shared cache to contend for; blocking only costs it (Step 9b: +4 % M-step at 1
+        // thread, −6.5 % at 20).
+        let block_lines = if threads > 1 { popts.block_lines } else { 0 };
+        let blocked = |e: u32| block_lines > 0 && dense.row(e).is_some();
+        assert!(
+            n_rows <= PART as usize,
+            "too many rows for the phase-B plan"
+        );
+        let mut bjobs: Vec<(u64, Spec)> = Vec::new();
+        let mut jobs: Vec<(u64, u32)> = Vec::new();
+        let mut parts: Vec<(u32, u32)> = Vec::new();
+        let mut block_rows = Vec::new();
+        let mut block_len = 0;
+        let mut si = split.iter().enumerate().peekable();
+        for e in 0..n_rows as u32 {
+            let len = table.row(e).len();
+            if len == 0 {
+                continue;
+            }
+            let c = cost[e as usize];
+            if let Some((s, (_, _, cuts))) = si.next_if(|(_, x)| x.0 == e) {
+                let k = (cuts.len() - 1) as u64;
+                for w in cuts.windows(2) {
+                    let p = parts.len() as u32;
+                    parts.push((s as u32, w[0] as u32));
+                    if blocked(e) {
+                        bjobs.push((c / k, Spec::Part { p }));
+                    } else {
+                        jobs.push((c / k, PART | p));
+                    }
+                }
+            } else if blocked(e) {
+                bjobs.push((
+                    c,
+                    Spec::Whole {
+                        e,
+                        cnt: block_rows.len() as u32,
+                    },
+                ));
+                block_rows.push(e);
+                block_len += len;
+            } else {
+                jobs.push((c, e));
+            }
+        }
+        bjobs.sort_by_key(|(c, _)| std::cmp::Reverse(*c));
+        jobs.sort_by_key(|(c, _)| std::cmp::Reverse(*c));
+        // Chunks of about 1/256 of a worker's share; a job's weight counts a fixed overhead
+        // per job and per cell besides its additions, so chunks of tiny rows stay short.
+        let weight = |c: u64, code: u32| {
+            let len = if code & PART == 0 {
+                table.row(code).len() as u64
+            } else {
+                0
+            };
+            c + len + 64
+        };
+        let total_w: u64 = jobs.iter().map(|&(c, code)| weight(c, code)).sum();
+        let target = (total_w / (threads as u64 * 256)).max(1);
+        let mut chunks = vec![0];
+        let mut acc = 0;
+        for (k, &(c, code)) in jobs.iter().enumerate() {
+            acc += weight(c, code);
+            if acc >= target {
+                chunks.push(k + 1);
+                acc = 0;
+            }
+        }
+        if *chunks.last().unwrap() != jobs.len() {
+            chunks.push(jobs.len());
+        }
+        Schedule {
+            threads,
+            split,
+            split_len,
+            block_lines,
+            block_rows,
+            block_len,
+            parts,
+            bjobs: bjobs.into_iter().map(|(_, s)| s).collect(),
+            jobs: jobs.into_iter().map(|(_, code)| code).collect(),
+            chunks,
+        }
+    }
+
+    fn memory_bytes(&self) -> usize {
+        self.split
+            .iter()
+            .map(|x| x.2.capacity() * 8 + 40)
+            .sum::<usize>()
+            + self.block_rows.capacity() * 4
+            + self.parts.capacity() * 8
+            + self.bjobs.capacity() * std::mem::size_of::<Spec>()
+            + self.jobs.capacity() * 4
+            + self.chunks.capacity() * 8
+    }
+}
+
+/// Move the `i`-th slice out of `v` (leaving an empty one).
+fn take<'a>(v: &mut [&'a mut [f64]], i: usize) -> &'a mut [f64] {
+    std::mem::take(&mut v[i])
+}
+
 /// Phase-B job trace record (`FA_TRACE_B`, measurement only): job index, row, split part,
 /// worker, start and end in seconds since the phase began.
 type JobTrace = (usize, u32, bool, usize, f64, f64);
@@ -1012,19 +1551,32 @@ pub struct Trainer<'c> {
     sums: Vec<f64>,
     az: Vec<f64>,
     a: Vec<f64>,
+    /// Bits of the tension `az` and `a` were built for: an iteration whose tension is
+    /// unchanged (no `-o`, or the iteration before the first optimisation) reuses them.
+    prior_lambda: Option<u64>,
+    /// Phase B's work plan, built on first use for the current thread count.
+    schedule: Option<Schedule>,
+    /// The opt-in cell-offset cache.
+    offsets: Option<OffsetCache>,
     /// `(size_counts index, j)` of every term of the tension gradient, in summation order.
     dlogz_terms: Vec<(u32, u32)>,
     times: PhaseTimes,
+    /// Checked during setup, at every iteration and in every phase task.
+    cancel: Cancel,
 }
 
 impl<'c> Trainer<'c> {
-    /// Run the initial pass (§6), writing fast_align's initial-pass log to `log`.
+    /// Run the initial pass (§6), writing fast_align's initial-pass log to `log`. The trainer
+    /// checks `cancel` during setup, at every iteration and in every phase task (see
+    /// [`crate::cancel`]); `&Cancel::default()` cannot be cancelled.
     pub fn new(
         corpus: &'c Corpus,
         opts: TrainOptions,
         popts: ParallelOptions,
+        cancel: &Cancel,
         log: &mut dyn Write,
     ) -> io::Result<Self> {
+        cancel.check();
         let mut text = b"INITIAL PASS \n".to_vec();
         let mut progress = Progress::default();
         let mut errors = corpus.empty_side_lines().iter().peekable();
@@ -1040,12 +1592,13 @@ impl<'c> Trainer<'c> {
         let (src, trg) = corpus.sides(opts.reverse);
         let mut times = PhaseTimes::default();
         let t0 = Instant::now();
-        let pass = initial_pass(
+        let pass = initial_pass_with(
             corpus,
             TableOptions {
                 reverse: opts.reverse,
                 use_null: opts.use_null,
             },
+            cancel,
         );
         progress.finish(&mut text);
         let _ = writeln!(
@@ -1061,14 +1614,17 @@ impl<'c> Trainer<'c> {
         let ((pairs, rows), target_freq) = rayon::join(
             || {
                 rayon::join(
-                    || LengthPairs::build(src, trg, popts.prior_cache_entries),
-                    || RowLines::build(src, trg, n_rows, opts.use_null),
+                    || LengthPairs::build(src, trg, popts.prior_cache_entries, cancel),
+                    || RowLines::build(src, trg, n_rows, opts.use_null, cancel),
                 )
             },
             || {
                 let mut freq = vec![0u32; corpus.vocab.len()];
-                for &f in trg.tokens() {
-                    freq[f as usize] = freq[f as usize].saturating_add(1);
+                for part in trg.tokens().chunks(CANCEL_STRIDE) {
+                    cancel.check();
+                    for &f in part {
+                        freq[f as usize] = freq[f as usize].saturating_add(1);
+                    }
                 }
                 freq
             },
@@ -1081,9 +1637,20 @@ impl<'c> Trainer<'c> {
                 }
             }
         }
+        cancel.check();
         let dense = DenseRows::build(&pass.table, &rows.cost, corpus.vocab.len(), &popts);
         let sampled = SampledRows::build(&pass.table, &dense, popts.sample_min_row_len);
         let cells = pass.table.n_cells();
+        let offsets = OffsetCache::build(
+            src,
+            trg,
+            corpus.vocab.len(),
+            opts.use_null,
+            popts.line_cells,
+            cells,
+            popts.offset_cache_bytes,
+            cancel,
+        );
         times.setup = t0.elapsed();
         Ok(Trainer {
             corpus,
@@ -1093,6 +1660,9 @@ impl<'c> Trainer<'c> {
             sums: vec![0.0; trg.n_tokens()],
             az: Vec::new(),
             a: Vec::new(),
+            prior_lambda: None,
+            schedule: None,
+            offsets,
             opts,
             popts,
             pass,
@@ -1103,6 +1673,7 @@ impl<'c> Trainer<'c> {
             target_freq,
             dlogz_terms,
             times,
+            cancel: cancel.clone(),
         })
     }
 
@@ -1144,6 +1715,16 @@ impl<'c> Trainer<'c> {
             + self.sampled.memory_bytes()
             + self.pairs.line_pair.capacity() * 4
             + self.target_freq.capacity() * 4
+            + self.schedule.as_ref().map_or(0, Schedule::memory_bytes)
+            + self.offsets.as_ref().map_or(0, OffsetCache::memory_bytes)
+    }
+
+    /// The cell-offset cache: bytes held, distinct pairs it covers per pass and distinct
+    /// pairs looked up per pass (`None` when it is off or nothing fits).
+    pub fn offset_cache_stats(&self) -> Option<(usize, u64, u64)> {
+        self.offsets
+            .as_ref()
+            .map(|c| (c.memory_bytes(), c.pairs_cached, c.pairs_total))
     }
 
     /// Run all iterations (§7): statistics to `log`, alignments of the final iteration to `out`.
@@ -1204,12 +1785,18 @@ impl<'c> Trainer<'c> {
         progress.finish(text);
     }
 
-    /// Fill the per-iteration prior cache for tension `lambda` (`-d` only).
+    /// Fill the per-iteration prior cache for the current tension (`-d` only). The tables are
+    /// a pure function of the tension (`p0` and the length pairs are fixed), so they are kept
+    /// while the tension's bits are unchanged.
     fn build_prior(&mut self) {
         if !self.opts.favor_diagonal {
             return;
         }
         let lambda = self.tension;
+        if self.prior_lambda == Some(lambda.to_bits()) {
+            return;
+        }
+        self.prior_lambda = Some(lambda.to_bits());
         let pnn = 1.0 - self.opts.p0;
         let pairs = &self.pairs;
         self.az.clear();
@@ -1267,6 +1854,7 @@ impl<'c> Trainer<'c> {
         log: &mut dyn Write,
         out: &mut dyn Write,
     ) -> io::Result<IterationStats> {
+        self.cancel.check();
         writeln!(
             log,
             "ITERATION {}{}",
@@ -1351,9 +1939,14 @@ impl<'c> Trainer<'c> {
     /// Phase A: column sums and per-buffer statistics, in parallel over groups.
     fn phase_a(&mut self, groups: &[Group]) -> Vec<Partial> {
         let mut sums = std::mem::take(&mut self.sums);
+        let mut cache = self.offsets.take();
+        let fill = self.probs_initialized && cache.as_ref().is_some_and(|c| !c.filled);
+        let cancel = &self.cancel;
         let partials = {
             let ctx = self.ctx();
             let n_vocab = self.corpus.vocab.len();
+            let line_cells = self.popts.line_cells;
+            let pool = ScratchPool::default();
             let offsets = ctx.trg.offsets();
             let mut rest = &mut sums[..];
             let mut slices = Vec::with_capacity(groups.len());
@@ -1363,15 +1956,34 @@ impl<'c> Trainer<'c> {
                 slices.push(h);
                 rest = t;
             }
+            // Filling: each group's part of the offset cache, carved in line order.
+            let mut fills: Vec<Option<(usize, &mut [u32])>> = Vec::with_capacity(groups.len());
+            let (cache_use, start): (Option<&OffsetCache>, &[u64]) = if fill {
+                let c = cache.as_mut().expect("filling needs the cache");
+                let cov = c.covered();
+                let mut rest = &mut c.off[..];
+                for g in groups {
+                    let (a, b) = (g.lines.start.min(cov), g.lines.end.min(cov));
+                    let (h, t) = rest.split_at_mut((c.start[b] - c.start[a]) as usize);
+                    rest = t;
+                    fills.push((a < b).then_some((c.start[a] as usize, h)));
+                }
+                (None, &c.start[..])
+            } else {
+                (cache.as_ref().filter(|c| c.filled), &[])
+            };
+            fills.resize_with(groups.len(), || None);
             let per_group: Vec<Vec<Partial>> = slices
                 .into_par_iter()
+                .zip(fills)
                 .zip(groups.par_iter())
                 .with_max_len(1)
-                .map(|(sums, g)| {
-                    crate::cancel::check();
+                .panic_fuse()
+                .map(|((sums, mut fill), g)| {
+                    cancel.check();
                     let base = offsets[g.lines.start];
-                    let mut probs = Vec::new();
-                    let mut lk = LineLookup::new(n_vocab);
+                    let mut scratch = pool.get(n_vocab, line_cells);
+                    let (probs, lk) = &mut *scratch;
                     let mut parts = Vec::new();
                     let mut s = g.lines.start;
                     while s < g.lines.end {
@@ -1379,38 +1991,57 @@ impl<'c> Trainer<'c> {
                         let mut part = Partial::default();
                         for line in s..e {
                             let r = offsets[line] - base..offsets[line + 1] - base;
-                            ctx.e_step_line(line, &mut sums[r], &mut part, &mut probs, &mut lk);
+                            let cached = match (&mut fill, cache_use) {
+                                (Some((o, f)), _) if line + 1 < start.len() => {
+                                    let a = start[line] as usize - *o;
+                                    let b = start[line + 1] as usize - *o;
+                                    Cached::Fill(&mut f[a..b])
+                                }
+                                (_, Some(c)) => c.line(line),
+                                _ => Cached::No,
+                            };
+                            ctx.e_step_line(line, &mut sums[r], &mut part, probs, lk, cached);
                         }
                         parts.push(part);
                         s = e;
                     }
+                    pool.put(scratch);
                     parts
                 })
                 .collect();
             per_group.into_iter().flatten().collect()
         };
+        if let Some(c) = &mut cache {
+            c.filled |= fill;
+        }
+        self.offsets = cache;
         self.sums = sums;
         partials
     }
 
     /// Final iteration: Viterbi decoding in parallel, output in corpus order.
     fn decode(&self, groups: &[Group], out: &mut dyn Write) -> io::Result<Vec<Partial>> {
+        let cancel = &self.cancel;
         let ctx = self.ctx();
         let n_vocab = self.corpus.vocab.len();
+        let line_cells = self.popts.line_cells;
         let scores = self
             .opts
             .print_scores
             .then_some(self.pass.mean_srclen_multiplier);
         let window = 4 * rayon::current_num_threads();
+        let pool = ScratchPool::default();
+        let cache = self.offsets.as_ref().filter(|c| c.filled);
         let mut partials = Vec::new();
         for win in groups.chunks(window) {
             let res: Vec<(String, Vec<Partial>)> = win
                 .par_iter()
                 .with_max_len(1)
+                .panic_fuse()
                 .map(|g| {
-                    crate::cancel::check();
-                    let mut probs = Vec::new();
-                    let mut lk = LineLookup::new(n_vocab);
+                    cancel.check();
+                    let mut scratch = pool.get(n_vocab, line_cells);
+                    let (probs, lk) = &mut *scratch;
                     let mut text = String::new();
                     let mut parts = Vec::new();
                     let mut s = g.lines.start;
@@ -1418,12 +2049,14 @@ impl<'c> Trainer<'c> {
                         let e = (s + g.buffer_lines).min(g.lines.end);
                         let mut part = Partial::default();
                         for line in s..e {
+                            let cached = cache.map_or(Cached::No, |c| c.line(line));
                             part.likelihood +=
-                                ctx.decode_line(line, scores, &mut text, &mut probs, &mut lk);
+                                ctx.decode_line(line, scores, &mut text, probs, lk, cached);
                         }
                         parts.push(part);
                         s = e;
                     }
+                    pool.put(scratch);
                     (text, parts)
                 })
                 .collect();
@@ -1437,70 +2070,26 @@ impl<'c> Trainer<'c> {
 
     /// Phase B: per-row count accumulation in corpus order, fused with the M-step.
     fn phase_b(&mut self) {
+        let t_setup = Instant::now();
+        let trace_on = std::env::var_os("FA_TRACE_B").is_some();
         let threads = rayon::current_num_threads();
-        let total: u64 = self.rows.cost.iter().sum();
-        let split_cost = self.popts.split_cost.unwrap_or(if threads > 1 {
-            (total / (2 * threads as u64)).max(1 << 14)
-        } else {
-            u64::MAX
-        });
+        let sched = match self.schedule.take() {
+            Some(s) if s.threads == threads => s,
+            _ => Schedule::build(
+                &self.pass.table,
+                &self.rows.cost,
+                &self.target_freq,
+                &self.dense,
+                &self.popts,
+                threads,
+            ),
+        };
         let table = &self.pass.table;
         let row_ptr = table.row_ptr();
         let n_rows = table.n_rows();
         let cols = table.cols();
-
-        // Split rows and their part boundaries (row-local cell indices).
-        let mut split: Vec<(u32, usize, Vec<usize>)> = Vec::new(); // (row, offset, cuts)
-        let mut split_len = 0;
-        for e in 0..n_rows as u32 {
-            let r = table.row(e);
-            let cost = self.rows.cost[e as usize];
-            if r.len() < 2 || cost <= split_cost {
-                continue;
-            }
-            let parts = (cost.div_ceil(split_cost) as usize).min(r.len()).min(256);
-            if parts < 2 {
-                continue;
-            }
-            let w: Vec<u64> = cols[r.clone()]
-                .iter()
-                .map(|&f| u64::from(self.target_freq[f as usize]).max(1))
-                .collect();
-            let tot: u64 = w.iter().sum();
-            let mut cuts = vec![0usize];
-            let mut acc = 0u64;
-            for (k, &x) in w.iter().enumerate() {
-                acc += x;
-                let q = cuts.len() as u64;
-                if acc * parts as u64 >= q * tot && k + 1 < r.len() && cuts.len() < parts {
-                    cuts.push(k + 1);
-                }
-            }
-            cuts.push(r.len());
-            cuts.dedup();
-            if cuts.len() > 2 {
-                split.push((e, split_len, cuts));
-                split_len += r.len();
-            }
-        }
-        let mut split_cnt = vec![0.0f64; split_len];
-        // Rows walked in line blocks (PERF-TODO 9): those with a dense index. Their counts
-        // must outlive one job, so whole rows get a buffer here (split rows use `split_cnt`).
-        // One thread has no shared cache to contend for; blocking only costs it (Step 9b:
-        // +4 % M-step at 1 thread, −6.5 % at 20).
-        let block_lines = if threads > 1 {
-            self.popts.block_lines
-        } else {
-            0
-        };
-        let dense = &self.dense;
-        let blocked = |e: u32| block_lines > 0 && dense.row(e).is_some();
-        let is_split = |e: u32| split.binary_search_by_key(&e, |x| x.0).is_ok();
-        let block_len: usize = (0..n_rows as u32)
-            .filter(|&e| blocked(e) && !is_split(e))
-            .map(|e| table.row(e).len())
-            .sum();
-        let mut block_cnt = vec![0.0f64; block_len];
+        let mut split_cnt = vec![0.0f64; sched.split_len];
+        let mut block_cnt = vec![0.0f64; sched.block_len];
 
         {
             // Phase B reads probabilities only through each job's own row.
@@ -1517,71 +2106,64 @@ impl<'c> Trainer<'c> {
                 &self.dense,
                 &self.sampled,
             );
-            let mut prob_rows: Vec<&mut [f64]> = Vec::with_capacity(n_rows);
+            // Row probabilities: whole rows are written by their job, split rows only read.
+            let mut whole: Vec<&mut [f64]> = Vec::with_capacity(n_rows);
+            let mut split_prob: Vec<&[f64]> = Vec::with_capacity(sched.split.len());
             let mut rest = &mut self.prob[..];
+            let mut si = sched.split.iter().peekable();
             for e in 0..n_rows {
                 let (h, t) = rest.split_at_mut(row_ptr[e + 1] - row_ptr[e]);
-                prob_rows.push(h);
+                rest = t;
+                if si.next_if(|x| x.0 as usize == e).is_some() {
+                    split_prob.push(h);
+                    whole.push(&mut []);
+                } else {
+                    whole.push(h);
+                }
+            }
+            // Count buffers of the split rows' parts and of the blocked whole rows, in the
+            // schedule's numbering.
+            let mut parts: Vec<&mut [f64]> = Vec::new();
+            let mut rest = &mut split_cnt[..];
+            for (_, _, cuts) in &sched.split {
+                for w in cuts.windows(2) {
+                    let (h, t) = rest.split_at_mut(w[1] - w[0]);
+                    parts.push(h);
+                    rest = t;
+                }
+            }
+            let mut bcnt: Vec<&mut [f64]> = Vec::with_capacity(sched.block_rows.len());
+            let mut rest = &mut block_cnt[..];
+            for &e in &sched.block_rows {
+                let (h, t) = rest.split_at_mut(table.row(e).len());
+                bcnt.push(h);
                 rest = t;
             }
-            let mut jobs: Vec<(u64, Job)> = Vec::new();
-            let mut bjobs: Vec<(u64, BlockJob)> = Vec::new();
-            let mut bcnt_rest = &mut block_cnt[..];
-            let mut cnt_rest = &mut split_cnt[..];
-            let mut si = split.iter().peekable();
-            for (e, prob) in prob_rows.into_iter().enumerate() {
-                if prob.is_empty() {
-                    continue;
-                }
-                let e = e as u32;
-                let cost = self.rows.cost[e as usize];
-                if let Some((_, _, cuts)) = si.next_if(|(se, _, _)| *se == e) {
-                    let prob: &[f64] = prob;
-                    let (mut row_cnt, t) = cnt_rest.split_at_mut(prob.len());
-                    cnt_rest = t;
-                    let k = (cuts.len() - 1) as u64;
-                    for w in cuts.windows(2) {
-                        let (h, t) = row_cnt.split_at_mut(w[1] - w[0]);
-                        row_cnt = t;
-                        if blocked(e) {
-                            bjobs.push((
-                                cost / k,
-                                BlockJob {
-                                    e,
-                                    k0: w[0],
-                                    prob: BlockProb::Part(prob),
-                                    cnt: h,
-                                    cur: (0, 0),
-                                },
-                            ));
-                        } else {
-                            jobs.push((
-                                cost / k,
-                                Job::Part {
-                                    e,
-                                    k0: w[0],
-                                    prob,
-                                    cnt: h,
-                                },
-                            ));
+            let bjobs: Vec<BlockJob> = sched
+                .bjobs
+                .iter()
+                .map(|s| match *s {
+                    Spec::Whole { e, cnt } => BlockJob {
+                        e,
+                        k0: 0,
+                        prob: BlockProb::Whole(take(&mut whole, e as usize)),
+                        cnt: take(&mut bcnt, cnt as usize),
+                        cur: (0, 0),
+                    },
+                    Spec::Part { p } => {
+                        let (s, k0) = sched.parts[p as usize];
+                        BlockJob {
+                            e: sched.split[s as usize].0,
+                            k0: k0 as usize,
+                            prob: BlockProb::Part(split_prob[s as usize]),
+                            cnt: take(&mut parts, p as usize),
+                            cur: (0, 0),
                         }
                     }
-                } else if blocked(e) {
-                    let (h, t) = bcnt_rest.split_at_mut(prob.len());
-                    bcnt_rest = t;
-                    bjobs.push((
-                        cost,
-                        BlockJob {
-                            e,
-                            k0: 0,
-                            prob: BlockProb::Whole(prob),
-                            cnt: h,
-                            cur: (0, 0),
-                        },
-                    ));
-                } else {
-                    jobs.push((cost, Job::Whole { e, prob }));
-                }
+                })
+                .collect();
+            if trace_on {
+                eprintln!("phase_b setup {:.4} s", t_setup.elapsed().as_secs_f64());
             }
             let t_blocked = Instant::now();
             run_blocked(
@@ -1591,29 +2173,50 @@ impl<'c> Trainer<'c> {
                 self.probs_initialized,
                 &self.opts,
                 bjobs,
-                block_lines,
+                sched.block_lines,
+                &self.cancel,
             );
-            if std::env::var_os("FA_TRACE_B").is_some() {
+            if trace_on {
                 eprintln!(
                     "phase_b blocked rows {:.3} s",
                     t_blocked.elapsed().as_secs_f64()
                 );
             }
-            // Largest first, then dynamic: a simple longest-processing-time schedule.
-            jobs.sort_by_key(|(c, _)| std::cmp::Reverse(*c));
-            let job_cost: Vec<u64> = jobs.iter().map(|(c, _)| *c).collect();
-            let trace_on = std::env::var_os("FA_TRACE_B").is_some();
+            // The other jobs, largest first, claimed a chunk at a time: a longest-processing-
+            // time schedule without a lock and an atomic per (often tiny) job.
+            let mut specs = sched.jobs.iter().map(|&code| {
+                if code & PART == 0 {
+                    Job::Whole {
+                        e: code,
+                        prob: take(&mut whole, code as usize),
+                    }
+                } else {
+                    let p = (code & !PART) as usize;
+                    let (s, k0) = sched.parts[p];
+                    Job::Part {
+                        e: sched.split[s as usize].0,
+                        k0: k0 as usize,
+                        prob: split_prob[s as usize],
+                        cnt: take(&mut parts, p),
+                    }
+                }
+            });
+            let chunks: Vec<Mutex<Vec<Job>>> = sched
+                .chunks
+                .windows(2)
+                .map(|w| Mutex::new(specs.by_ref().take(w[1] - w[0]).collect()))
+                .collect();
             let trace: Mutex<Vec<JobTrace>> = Mutex::new(Vec::new());
             let t_phase = Instant::now();
-            let jobs: Vec<Mutex<Option<Job>>> =
-                jobs.into_iter().map(|(_, j)| Mutex::new(Some(j))).collect();
             let next = AtomicUsize::new(0);
             let n_vocab = self.corpus.vocab.len();
             let rows = &self.rows;
             let opts = &self.opts;
             let sums = &self.sums[..];
             let prob_init = self.probs_initialized;
-            (0..threads.min(jobs.len()).max(1))
+            let cancel = &self.cancel;
+            let first_job = &sched.chunks;
+            (0..threads.min(chunks.len()).max(1))
                 .into_par_iter()
                 .for_each(|worker| {
                     let mut s = RowScratch {
@@ -1622,62 +2225,77 @@ impl<'c> Trainer<'c> {
                         pos: Vec::new(),
                     };
                     loop {
-                        let k = next.fetch_add(1, Ordering::Relaxed);
-                        let Some(slot) = jobs.get(k) else { break };
-                        crate::cancel::check();
-                        let job = slot.lock().unwrap().take().unwrap();
-                        let t_job = t_phase.elapsed().as_secs_f64();
-                        let (je, jpart) = match &job {
-                            Job::Whole { e, .. } => (*e, false),
-                            Job::Part { e, .. } => (*e, true),
-                        };
-                        match job {
-                            Job::Whole { e, prob } => {
-                                let row_cols = &cols[table.row(e)];
-                                let mut cnt = std::mem::take(&mut s.cnt);
-                                cnt.clear();
-                                cnt.resize(row_cols.len(), 0.0);
-                                accumulate(
-                                    &ctx, rows, sums, e, row_cols, true, prob, prob_init, &mut cnt,
-                                    &mut s,
-                                );
-                                normalise(&cnt, table.row_order(e), prob, opts);
-                                s.cnt = cnt;
+                        let c = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(slot) = chunks.get(c) else { break };
+                        cancel.check();
+                        let jobs = std::mem::take(&mut *slot.lock().unwrap());
+                        for (n, job) in jobs.into_iter().enumerate() {
+                            let t_job = trace_on.then(|| t_phase.elapsed().as_secs_f64());
+                            let (je, jpart) = match &job {
+                                Job::Whole { e, .. } => (*e, false),
+                                Job::Part { e, .. } => (*e, true),
+                            };
+                            match job {
+                                Job::Whole { e, prob } => {
+                                    let row_cols = &cols[table.row(e)];
+                                    let mut cnt = std::mem::take(&mut s.cnt);
+                                    cnt.clear();
+                                    cnt.resize(row_cols.len(), 0.0);
+                                    accumulate(
+                                        &ctx, rows, sums, e, row_cols, true, prob, prob_init,
+                                        &mut cnt, &mut s,
+                                    );
+                                    normalise(&cnt, table.row_order(e), prob, opts);
+                                    s.cnt = cnt;
+                                }
+                                Job::Part { e, k0, prob, cnt } => {
+                                    let row_cols = &cols[table.row(e)][k0..k0 + cnt.len()];
+                                    accumulate(
+                                        &ctx,
+                                        rows,
+                                        sums,
+                                        e,
+                                        row_cols,
+                                        false,
+                                        &prob[k0..],
+                                        prob_init,
+                                        cnt,
+                                        &mut s,
+                                    );
+                                }
                             }
-                            Job::Part { e, k0, prob, cnt } => {
-                                let row_cols = &cols[table.row(e)][k0..k0 + cnt.len()];
-                                accumulate(
-                                    &ctx,
-                                    rows,
-                                    sums,
-                                    e,
-                                    row_cols,
-                                    false,
-                                    &prob[k0..],
-                                    prob_init,
-                                    cnt,
-                                    &mut s,
-                                );
+                            if let Some(t0) = t_job {
+                                let t1 = t_phase.elapsed().as_secs_f64();
+                                let k = first_job[c] + n;
+                                trace.lock().unwrap().push((k, je, jpart, worker, t0, t1));
                             }
-                        }
-                        if trace_on {
-                            let t1 = t_phase.elapsed().as_secs_f64();
-                            trace
-                                .lock()
-                                .unwrap()
-                                .push((k, je, jpart, worker, t_job, t1));
                         }
                     }
                 });
             if trace_on {
+                let cost = &self.rows.cost;
+                let job_cost: Vec<u64> = sched
+                    .jobs
+                    .iter()
+                    .map(|&code| {
+                        if code & PART == 0 {
+                            cost[code as usize]
+                        } else {
+                            let (s, _) = sched.parts[(code & !PART) as usize];
+                            let (e, _, cuts) = &sched.split[s as usize];
+                            cost[*e as usize] / (cuts.len() - 1) as u64
+                        }
+                    })
+                    .collect();
                 let wall = t_phase.elapsed().as_secs_f64();
                 let mut t = trace.into_inner().unwrap();
                 let busy: f64 = t.iter().map(|x| x.5 - x.4).sum();
                 let total_cost: u64 = job_cost.iter().sum();
                 let last_start = t.iter().map(|x| x.4).fold(0.0, f64::max);
                 eprintln!(
-                    "phase_b wall {wall:.3} s, jobs {}, busy {busy:.2} worker-s, last job start {last_start:.3}",
-                    t.len()
+                    "phase_b wall {wall:.3} s, jobs {}, chunks {}, busy {busy:.2} worker-s, last job start {last_start:.3}",
+                    t.len(),
+                    chunks.len()
                 );
                 let mut per_worker = vec![0.0f64; threads];
                 for x in &t {
@@ -1706,8 +2324,8 @@ impl<'c> Trainer<'c> {
         let prob = &mut self.prob;
         let mut rest = &mut prob[..];
         let mut consumed = 0;
-        let mut targets = Vec::with_capacity(split.len());
-        for (e, off, _) in &split {
+        let mut targets = Vec::with_capacity(sched.split.len());
+        for (e, off, _) in &sched.split {
             let r = table.row(*e);
             let (_, t) = rest.split_at_mut(r.start - consumed);
             let (h, t) = t.split_at_mut(r.len());
@@ -1718,6 +2336,7 @@ impl<'c> Trainer<'c> {
         targets.into_par_iter().for_each(|(e, cnt, prob)| {
             normalise(cnt, table.row_order(e), prob, opts);
         });
+        self.schedule = Some(sched);
     }
 
     /// Eight gradient steps on λ (§10.2); terms in parallel, summed in fast_align's order.
@@ -1759,7 +2378,14 @@ impl<'c> Trainer<'c> {
         beam_threshold: f64,
         w: &mut dyn Write,
     ) -> io::Result<()> {
-        write_text_table(&self.pass.table, &self.prob, vocab, beam_threshold, w)
+        write_text_table(
+            &self.pass.table,
+            &self.prob,
+            vocab,
+            beam_threshold,
+            &self.cancel,
+            w,
+        )
     }
 
     /// Give up the corpus borrow: the table structure and the final probabilities.
@@ -1791,6 +2417,7 @@ pub fn write_text_table(
     prob: &[f64],
     vocab: &Vocab,
     beam_threshold: f64,
+    cancel: &Cancel,
     w: &mut dyn Write,
 ) -> io::Result<()> {
     let row_ptr = table.row_ptr();
@@ -1810,7 +2437,9 @@ pub fn write_text_table(
     for win in chunks.chunks(window) {
         let texts: Vec<Vec<u8>> = win
             .par_iter()
+            .panic_fuse()
             .map(|rows| {
+                cancel.check();
                 let mut buf = Vec::new();
                 let mut num = String::new();
                 for e in rows.clone() {
@@ -1870,8 +2499,9 @@ fn run_blocked(
     sums: &[f64],
     prob_init: bool,
     opts: &TrainOptions,
-    bjobs: Vec<(u64, BlockJob)>,
+    bjobs: Vec<BlockJob>,
     block_lines: usize,
+    cancel: &Cancel,
 ) {
     if bjobs.is_empty() {
         return;
@@ -1880,11 +2510,10 @@ fn run_blocked(
     let table = ctx.table;
     let cols = table.cols();
     let n_lines = ctx.src.offsets().len() - 1;
-    let mut bjobs = bjobs;
-    bjobs.sort_by_key(|(c, _)| std::cmp::Reverse(*c));
-    let bjobs: Vec<Mutex<BlockJob>> = bjobs.into_iter().map(|(_, j)| Mutex::new(j)).collect();
+    // Already largest first (`Schedule::bjobs`).
+    let bjobs: Vec<Mutex<BlockJob>> = bjobs.into_iter().map(Mutex::new).collect();
     for b0 in (0..n_lines).step_by(block_lines.max(1)) {
-        crate::cancel::check();
+        cancel.check();
         let end = (b0 + block_lines).min(n_lines) as u32;
         let next = AtomicUsize::new(0);
         (0..threads.min(bjobs.len())).into_par_iter().for_each(|_| {
@@ -2228,12 +2857,89 @@ pub fn train_both<'c>(
     popts: &ParallelOptions,
     fwd_sinks: Sinks<'_>,
     rev_sinks: Sinks<'_>,
+    cancel: &Cancel,
 ) -> io::Result<(Trainer<'c>, Trainer<'c>)> {
     let run = |opts: TrainOptions, sinks: Sinks<'_>| -> io::Result<Trainer<'c>> {
-        let mut t = Trainer::new(corpus, opts, popts.clone(), sinks.log)?;
+        let mut t = Trainer::new(corpus, opts, popts.clone(), cancel, sinks.log)?;
         t.train(sinks.log, sinks.out)?;
         Ok(t)
     };
     let (a, b) = rayon::join(|| run(fwd, fwd_sinks), || run(rev, rev_sinks));
     Ok((a?, b?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::corpus::LoadOptions;
+
+    /// A corpus with repeated words, several occurrences per line and lines of varied length.
+    fn varied_corpus() -> Corpus {
+        let mut t = String::new();
+        let mut x = 12345u64;
+        for _ in 0..400 {
+            for side in 0..2 {
+                x = x
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                let n = (x >> 60) as usize;
+                for k in 0..n {
+                    x = x
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    t += &format!(
+                        "{}{} ",
+                        if side == 0 { "s" } else { "t" },
+                        (x >> 59) * (k as u64 % 3)
+                    );
+                }
+                if side == 0 {
+                    t += "||| ";
+                }
+            }
+            t += "\n";
+        }
+        Corpus::from_joined_bytes(t.as_bytes(), &LoadOptions::default()).unwrap()
+    }
+
+    /// Review #12: the row-line CSR parts are cut so that their `u32` offsets cannot overflow;
+    /// every row's lines, single positions and costs are the same whatever the cut.
+    #[test]
+    fn row_lines_do_not_depend_on_the_part_limit() {
+        let c = varied_corpus();
+        let n_rows = c.vocab.len();
+        let longest = (0..c.len()).map(|k| c.first.line_len(k)).max().unwrap();
+        let cancel = Cancel::default();
+        for use_null in [true, false] {
+            // one thread: one part unless the limit cuts it
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .unwrap();
+            let base =
+                pool.install(|| RowLines::build(&c.first, &c.second, n_rows, use_null, &cancel));
+            assert_eq!(base.parts.len(), 1);
+            for limit in [longest, longest + 3, 50, 997] {
+                let r = pool.install(|| {
+                    RowLines::build_with(&c.first, &c.second, n_rows, use_null, limit, &cancel)
+                });
+                assert!(r.parts.len() > base.parts.len());
+                for p in &r.parts {
+                    assert!(p.lines.len() <= limit);
+                }
+                assert_eq!(r.cost, base.cost);
+                assert_eq!(r.eps_in_src, base.eps_in_src);
+                for e in 0..n_rows as u32 {
+                    if use_null && e == NULL_ID {
+                        continue;
+                    }
+                    assert!(base.lines(e).eq(r.lines(e)), "row {e}, limit {limit}");
+                    let (mut a, mut b) = ((0, 0), (0, 0));
+                    let x: Vec<_> = base.lines_before(e, &mut a, 200).collect();
+                    let y: Vec<_> = r.lines_before(e, &mut b, 200).collect();
+                    assert_eq!(x, y);
+                }
+            }
+        }
+    }
 }

@@ -16,8 +16,9 @@ from __future__ import annotations
 
 import argparse
 import sys
-from collections import defaultdict
+from collections import defaultdict, deque
 from collections.abc import Iterable
+from itertools import islice
 
 Link = tuple[int, int]
 
@@ -61,6 +62,31 @@ def parse_pharaoh(line: str) -> set[Link]:
     return links
 
 
+def read_window(lines: Iterable[str], offset: int, n: int) -> list[set[Link]]:
+    """Parse exactly ``n`` hypothesis lines starting at ``offset`` (negative: from the end).
+
+    Streams the input: only the window is parsed and, for a negative offset, only the last
+    ``-offset`` lines are kept. A file that is too short or has surplus lines after the window
+    is an error (a truncated or mismatched result file must not score).
+    """
+    if offset < 0:
+        window = [*deque(lines, maxlen=-offset)]
+        if len(window) < -offset:
+            raise ValueError(f"the hypothesis has {len(window)} lines, offset {offset} needs more")
+        if -offset != n:
+            raise ValueError(f"the last {-offset} hypothesis lines were requested, gold has {n}")
+    else:
+        it = iter(lines)
+        for _ in islice(it, offset):
+            pass
+        window = list(it)
+        if len(window) != n:
+            raise ValueError(
+                f"the hypothesis has {len(window)} lines after offset {offset}, gold has {n}"
+            )
+    return [parse_pharaoh(line) for line in window]
+
+
 def score(hyp: list[set[Link]], sure: list[set[Link]], poss: list[set[Link]]) -> dict[str, float]:
     """Return precision, recall and AER (all as fractions in [0, 1]) over all sentences."""
     if not (len(hyp) == len(sure) == len(poss)):
@@ -95,15 +121,15 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--format", choices=["text", "tsv"], default="text")
     args = ap.parse_args(argv)
 
-    with open(args.gold, encoding="utf-8") as f:
-        sure, poss = read_gold(f)
-    with open(args.hyp, encoding="utf-8") as f:
-        all_hyp = [parse_pharaoh(line) for line in f]
-    offset = args.offset if args.offset >= 0 else len(all_hyp) + args.offset
-    hyp = all_hyp[offset : offset + len(sure)]
     try:
+        with open(args.gold, encoding="utf-8") as f:
+            sure, poss = read_gold(f)
+        if not sure:
+            raise ValueError("the gold file has no sentences")
+        with open(args.hyp, encoding="utf-8") as f:
+            hyp = read_window(f, args.offset, len(sure))
         r = score(hyp, sure, poss)
-    except ValueError as e:
+    except (ValueError, OSError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
     if args.format == "tsv":

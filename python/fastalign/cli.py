@@ -10,9 +10,11 @@ import logging
 import os
 import sys
 import time
+import warnings
 
 import fastalign
 from fastalign import _core
+from fastalign._input import StdinText
 from fastalign.model import METHODS, _method
 
 #: ``intersection`` is accepted for ``intersect`` (the sister tool's name).
@@ -38,7 +40,9 @@ def _add_model_args(p: argparse.ArgumentParser) -> None:
         "--tension",
         type=float,
         default=4.0,
-        help="starting tension of the diagonal prior (default %(default)s)",
+        help="starting tension of the diagonal prior (default %(default)s): a finite number of "
+        "magnitude at least 1e-6 (at 0 the prior is 0/0); negative values favour the "
+        "anti-diagonal, as in fast_align",
     )
     p.add_argument(
         "--p0",
@@ -62,9 +66,13 @@ def build_parser() -> argparse.ArgumentParser:
     t = sub.add_parser("train", help="train on a parallel corpus and write alignments")
     t.add_argument(
         "input",
-        help="corpus: one file of `source ||| target` lines, or the source text (then give TGT)",
+        help="corpus: one file of `source ||| target` lines, or the source text (then give "
+        "TGT); `-` reads standard input. With two files each file is one side: tabs and `|||` "
+        "inside a line are ordinary whitespace and words there",
     )
-    t.add_argument("tgt", nargs="?", help="target text, line-aligned with INPUT")
+    t.add_argument(
+        "tgt", nargs="?", help="target text, line-aligned with INPUT (`-`: standard input)"
+    )
     t.add_argument(
         "-o",
         "--output",
@@ -103,6 +111,16 @@ def build_parser() -> argparse.ArgumentParser:
         "empty alignment lines",
     )
     t.add_argument(
+        "--empty-pairs",
+        choices=["keep", "skip", "error"],
+        default="keep",
+        help="line pairs with an empty side: `keep` trains on them as fast_align does (an empty "
+        "source side makes the forward length ratio infinite and, with tension optimisation, "
+        "the tension NaN, so that direction aligns nothing; a blank line makes every score "
+        "NaN); `skip` drops them (empty output line, input line numbers kept); `error` fails "
+        "and lists them (default %(default)s)",
+    )
+    t.add_argument(
         "-s",
         "--symmetrize",
         action="append",
@@ -114,7 +132,7 @@ def build_parser() -> argparse.ArgumentParser:
     t.add_argument(
         "--scores",
         action="store_true",
-        help="append ` ||| score` (log probability of the best alignment) to directional lines",
+        help="append ` ||| score` to directional lines: the log of the pair's probability under the model, summed over all alignments (length term plus, per target word, the log of the sum over source positions); the best alignment only chooses the printed links",
     )
     t.add_argument(
         "--no-lookup-index",
@@ -122,10 +140,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="do not build the dense lookup index of the busiest table rows (saves 64 MB per "
         "direction, slower E-step and M-step; no output changes)",
     )
+    t.add_argument(
+        "--offset-cache",
+        type=int,
+        default=0,
+        metavar="MB",
+        help="MiB per direction for the opt-in cell-offset cache (default 0: off). The first "
+        "E-step stores each line's table cells, later E-steps and decoding read through them: "
+        "en-fr large ≈ 1.7 GB per direction for all lines, −25%% time at 1 thread, −20%% at 20. "
+        "Lines beyond the budget are looked up as usual; no output changes",
+    )
     sw = t.add_argument_group(
         "subword alignment",
         "Align pieces, write word alignments. --subword trains SentencePiece (needs "
-        "`pip install 'fastalign[subword]'`) and stores it in the --save model; the native "
+        "`pip install 'fastalign-revisited[subword]'`) and stores it in the --save model; the native "
         "binary has only --subword-marker/--subword-continuation for text that is already "
         "segmented.",
     )
@@ -193,7 +221,8 @@ def build_parser() -> argparse.ArgumentParser:
         "files",
         nargs="+",
         metavar="FILE",
-        help="MODEL SRC [TGT], or with --table: SRC [TGT]; SRC alone is a `source ||| target` file",
+        help="MODEL SRC [TGT], or with --table: SRC [TGT]; SRC alone is a `source ||| target` "
+        "file; SRC or TGT may be `-` (standard input)",
     )
     a.add_argument("-o", "--output", help="output file (default: standard output)")
     a.add_argument(
@@ -210,7 +239,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="direction written without --symmetrize (with --table: which one the table is "
         "for); default %(default)s",
     )
-    a.add_argument("--scores", action="store_true", help="append ` ||| score` to each line")
+    a.add_argument(
+        "--scores",
+        action="store_true",
+        help="append ` ||| score` to each line: the log of the pair's probability under the model, summed over all alignments (length term plus, per target word, the log of the sum over source positions); the best alignment only chooses the printed links; one direction only",
+    )
     _add_threads(a)
     a.add_argument(
         "--table",
@@ -237,6 +270,7 @@ def build_parser() -> argparse.ArgumentParser:
         "-m", "--method", choices=[*_METHOD_CHOICES, "invert"], default="grow-diag-final-and"
     )
     s.add_argument("-o", "--output", help="output file (default: standard output)")
+    _add_threads(s)
 
     e = sub.add_parser(
         "export-table", help="write a saved model's table in fast_align's -p text format"
@@ -244,7 +278,13 @@ def build_parser() -> argparse.ArgumentParser:
     e.add_argument("model")
     e.add_argument("-o", "--output", help="output file (default: standard output)")
     e.add_argument("--direction", choices=["fwd", "inv"], default="fwd")
-    e.add_argument("--beam-threshold", type=float, default=-4.0)
+    e.add_argument(
+        "--beam-threshold",
+        type=float,
+        default=-4.0,
+        help="keep entries with probability at least (row maximum) ** -threshold "
+        "(fast_align -t; default %(default)s: max**4)",
+    )
     _add_threads(e)
     return parser
 
@@ -259,11 +299,28 @@ def _write_bytes(path: str | None, data: bytes) -> None:
         sys.stdout.buffer.flush()
 
 
+def _write_alignments(path: str | None, alignments) -> None:
+    """Alignments to a file (staged and renamed, written from the stored text without a bytes
+    copy) or to standard output."""
+    if path:
+        alignments.write(path)
+    else:
+        _write_bytes(None, alignments.to_bytes())
+
+
 def _read_bytes(path: str) -> bytes:
     if path == "-":
         return sys.stdin.buffer.read()
     with open(path, "rb") as f:
         return f.read()
+
+
+def _inputs(*paths: str | None) -> list:
+    """Corpus arguments for the API: ``-`` is standard input, read once (as the native CLI
+    does); every other path is passed on (pipes and FIFOs are read to the end there)."""
+    if sum(p == "-" for p in paths) > 1:
+        raise ValueError("standard input (`-`) can be only one of the input files")
+    return [StdinText(sys.stdin.buffer.read()) if p == "-" else p for p in paths]
 
 
 def _subword_arg(args: argparse.Namespace):
@@ -321,9 +378,35 @@ def _cmd_train(args: argparse.Namespace) -> None:
     if args.subword_output and not args.output:
         raise ValueError("--subword-output needs --output PREFIX")
     t0 = time.perf_counter()
-    model = fastalign.train(
-        args.input,
-        args.tgt,
+    src, tgt = _inputs(args.input, args.tgt)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        model = _train(args, src, tgt, subword)
+    for w in caught:
+        if issubclass(w.category, RuntimeWarning) and str(w.message) in model.training_warnings:
+            # as the native binary: not part of the reference-format output, shown with --quiet
+            print(f"fastalign: warning: {w.message}", file=sys.stderr)
+        else:
+            warnings.showwarning(w.message, w.category, w.filename, w.lineno)
+    _write_training_outputs(args, model)
+    logging.getLogger("fastalign").info("done in %.1f s", time.perf_counter() - t0)
+
+
+def _train(args: argparse.Namespace, src, tgt, subword) -> fastalign.Model:
+    # Output files only unless --save needs the models: tables are written (and each
+    # direction's model dropped) as the direction finishes.
+    prefix = args.output
+    tables = (
+        {
+            d: f"{prefix}.{d}.table"
+            for d in (["fwd", "inv"] if args.directions == "both" else [args.directions])
+        }
+        if args.table and prefix
+        else None
+    )
+    return fastalign.train(
+        src,
+        tgt,
         threads=args.threads,
         directions=args.directions,
         iterations=args.iterations,
@@ -336,15 +419,23 @@ def _cmd_train(args: argparse.Namespace) -> None:
         null=not args.no_null,
         buffer_size=args.buffer_size,
         max_len=args.max_len,
+        empty_pairs=args.empty_pairs,
         scores=args.scores,
         lookup_index=not args.no_lookup_index,
+        offset_cache_mb=args.offset_cache,
         subword=subword,
         subword_output=args.subword_output,
+        _outputs_only=not args.save,
+        _table_files=tables,
+        _table_beam=args.beam_threshold,
     )
+
+
+def _write_training_outputs(args: argparse.Namespace, model: fastalign.Model) -> None:
     prefix = args.output
     for d in model.directions:
         if prefix is None:
-            _write_bytes(None, model.alignments(direction=d).to_bytes())
+            _write_alignments(None, model.alignments(direction=d))
             continue
         model.write_alignments(f"{prefix}.{d}.pharaoh", direction=d)
         if args.subword_output:
@@ -354,15 +445,10 @@ def _cmd_train(args: argparse.Namespace) -> None:
             if args.table:
                 log += f"conditional probabilities: {prefix}.{d}.table\n".encode()
             _write_bytes(f"{prefix}.{d}.log", log)
-        if args.table:
-            model.write_table(
-                f"{prefix}.{d}.table", d, beam_threshold=args.beam_threshold, threads=args.threads
-            )
     for m in args.symmetrize:
         model.write_alignments(f"{prefix}.{_method(m)}.pharaoh", symmetrize=m)
     if args.save:
         model.save(args.save)
-    logging.getLogger("fastalign").info("done in %.1f s", time.perf_counter() - t0)
 
 
 def _cmd_align(args: argparse.Namespace) -> int:
@@ -372,10 +458,11 @@ def _cmd_align(args: argparse.Namespace) -> int:
             raise ValueError("usage: fastalign align --table TABLE SRC [TGT]")
         if args.symmetrize:
             raise ValueError("--symmetrize is not available with --table")
+        src, tgt = _inputs(files[0], files[1] if len(files) == 2 else None)
         res = fastalign.align_with_table(
             args.table,
-            files[0],
-            files[1] if len(files) == 2 else None,
+            src,
+            tgt,
             direction=args.direction,
             diagonal=not args.no_diagonal,
             null=not args.no_null,
@@ -391,16 +478,17 @@ def _cmd_align(args: argparse.Namespace) -> int:
         raise ValueError("usage: fastalign align MODEL SRC [TGT]")
     if args.symmetrize and args.scores:
         raise ValueError("--scores belongs to one direction; drop --symmetrize")
+    src, tgt = _inputs(files[1], files[2] if len(files) == 3 else None)
     model = fastalign.Model.load(files[0])
     result = model.align_many(
-        files[1],
-        files[2] if len(files) == 3 else None,
+        src,
+        tgt,
         symmetrize=args.symmetrize,
         direction=None if args.symmetrize else args.direction,
         threads=args.threads,
         scores=args.scores,
     )
-    _write_bytes(args.output, result.to_bytes())
+    _write_alignments(args.output, result)
     return 0
 
 
@@ -408,9 +496,11 @@ def _cmd_symmetrize(args: argparse.Namespace) -> None:
     method = _method(args.method)
     if method != "invert" and args.inv is None:
         raise ValueError(f"{method} needs two alignment files")
+    if method != "invert" and args.fwd == "-" and args.inv == "-":
+        raise ValueError("standard input (`-`) can be only one of the input files")
     fwd = _read_bytes(args.fwd)
     inv = _read_bytes(args.inv) if (args.inv is not None and method != "invert") else None
-    _write_bytes(args.output, _core.symmetrize_text(fwd, inv, method))
+    _write_bytes(args.output, _core.symmetrize_text(fwd, inv, method, args.threads))
 
 
 def _cmd_export(args: argparse.Namespace) -> None:

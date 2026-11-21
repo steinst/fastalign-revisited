@@ -14,7 +14,8 @@ use std::ops::Range;
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 
-use crate::corpus::{Corpus, Side, NULL_ID};
+use crate::cancel::Cancel;
+use crate::corpus::{part_ranges, Corpus, Side, MAX_PART_ENTRIES, NULL_ID};
 use crate::stlhash::{hash_len_pair, hash_u32, StlOrder};
 
 /// Options of the initial pass that change the table.
@@ -289,12 +290,22 @@ pub struct InitialPass {
     pub options: TableOptions,
 }
 
+/// Lines (or target tokens of the NULL row) between two cancellation checks of the setup.
+pub(crate) const CANCEL_STRIDE: usize = 1 << 16;
+
 /// Run fast_align's initial pass over `corpus` for one direction.
 pub fn initial_pass(corpus: &Corpus, opts: TableOptions) -> InitialPass {
+    initial_pass_with(corpus, opts, &Cancel::default())
+}
+
+/// [`initial_pass`], checking `cancel` per row, per stretch of lines and per stretch of the
+/// NULL row (see [`crate::cancel`]).
+pub fn initial_pass_with(corpus: &Corpus, opts: TableOptions, cancel: &Cancel) -> InitialPass {
+    cancel.check();
     let (src, trg) = corpus.sides(opts.reverse);
     let (table, stats) = rayon::join(
-        || build_table(corpus.vocab.len(), src, trg, opts),
-        || length_statistics(src, trg),
+        || build_table(corpus.vocab.len(), src, trg, opts, cancel),
+        || length_statistics(src, trg, cancel),
     );
     let (size_counts, tot_len_ratio, n_target_tokens) = stats;
     let n_lines = corpus.len();
@@ -310,7 +321,7 @@ pub fn initial_pass(corpus: &Corpus, opts: TableOptions) -> InitialPass {
 }
 
 /// `size_counts` in iteration order, `tot_len_ratio`, `n_target_tokens` (spec §6, §14.6).
-fn length_statistics(src: &Side, trg: &Side) -> (Vec<SizeCount>, f64, f64) {
+fn length_statistics(src: &Side, trg: &Side, cancel: &Cancel) -> (Vec<SizeCount>, f64, f64) {
     let n_lines = src.offsets().len() - 1;
     let mut tot = 0.0f64;
     let mut ntt = 0.0f64;
@@ -319,6 +330,9 @@ fn length_statistics(src: &Side, trg: &Side) -> (Vec<SizeCount>, f64, f64) {
     let mut counts: Vec<u32> = Vec::new();
     let mut order = StlOrder::new();
     for k in 0..n_lines {
+        if k % CANCEL_STRIDE == 0 {
+            cancel.check();
+        }
         let m = trg.line_len(k);
         let n = src.line_len(k);
         tot += m as f64 / n as f64;
@@ -349,15 +363,22 @@ struct Postings {
 }
 
 impl Postings {
-    fn build(src: &Side, n_vocab: usize) -> Self {
+    fn build(src: &Side, n_vocab: usize, cancel: &Cancel) -> Self {
+        Self::build_with(src, n_vocab, MAX_PART_ENTRIES, cancel)
+    }
+
+    /// `max_entries` bounds every part's occurrences (its `u32` offsets); tests lower it.
+    fn build_with(src: &Side, n_vocab: usize, max_entries: usize, cancel: &Cancel) -> Self {
         let n_lines = src.offsets().len() - 1;
         let n_parts = rayon::current_num_threads().clamp(1, n_lines.max(1));
-        let parts = (0..n_parts)
+        let parts = part_ranges(src, n_parts, max_entries)
             .into_par_iter()
-            .map(|p| {
-                let lines = n_lines * p / n_parts..n_lines * (p + 1) / n_parts;
+            .map(|lines| {
                 let mut start = vec![0u32; n_vocab + 1];
                 for k in lines.clone() {
+                    if k % CANCEL_STRIDE == 0 {
+                        cancel.check();
+                    }
                     for &e in src.line(k) {
                         start[e as usize + 1] += 1;
                     }
@@ -404,8 +425,14 @@ struct RowOut {
     buckets: u64,
 }
 
-fn build_table(n_vocab: usize, src: &Side, trg: &Side, opts: TableOptions) -> TTable {
-    let postings = Postings::build(src, n_vocab);
+fn build_table(
+    n_vocab: usize,
+    src: &Side,
+    trg: &Side,
+    opts: TableOptions,
+    cancel: &Cancel,
+) -> TTable {
+    let postings = Postings::build(src, n_vocab, cancel);
     let max_src = src.tokens().par_iter().copied().max();
     // fast_align's counts.size(): the insert buffer covers every source id (SetMaxE), and a
     // direct NULL insert makes row 1 exist. (An input without any source token would make
@@ -424,6 +451,9 @@ fn build_table(n_vocab: usize, src: &Side, trg: &Side, opts: TableOptions) -> TT
         // fall into the first few of rayon's adaptive pieces and the loop ran on ~2 threads.
         // Small pieces spread them (Step 9b: 1.67 -> 0.30 s at 20 threads on en-fr large).
         .with_max_len(16)
+        // Once a row has unwound (cancellation), skip the remaining rows instead of starting
+        // and unwinding every one of the thousands of small tasks in turn.
+        .panic_fuse()
         .map_init(
             || Scratch {
                 seen: vec![0; n_vocab],
@@ -433,10 +463,11 @@ fn build_table(n_vocab: usize, src: &Side, trg: &Side, opts: TableOptions) -> TT
                 rank: Vec::new(),
             },
             |s, e| {
+                cancel.check();
                 s.seq.clear();
                 let stamp = e + 1;
                 if e == NULL_ID {
-                    null_row_sequence(trg, &postings, opts, s, stamp);
+                    null_row_sequence(trg, &postings, opts, s, stamp, cancel);
                 } else {
                     ordinary_row_sequence(trg, &postings, e, s, stamp);
                 }
@@ -496,10 +527,14 @@ fn null_row_sequence(
     opts: TableOptions,
     s: &mut Scratch,
     stamp: u32,
+    cancel: &Cancel,
 ) {
     if opts.use_null {
-        for &f in trg.tokens() {
-            push_new(s, f, stamp);
+        for part in trg.tokens().chunks(CANCEL_STRIDE) {
+            cancel.check();
+            for &f in part {
+                push_new(s, f, stamp);
+            }
         }
     } else {
         ordinary_row_sequence(trg, postings, NULL_ID, s, stamp);
@@ -552,7 +587,7 @@ mod tests {
     use crate::stlhash::u32_order;
 
     fn corpus(text: &[u8]) -> Corpus {
-        Corpus::from_joined_bytes(text, &LoadOptions::default())
+        Corpus::from_joined_bytes(text, &LoadOptions::default()).unwrap()
     }
 
     /// Rows longer than 65,536 cells keep their order in `u32`; every row's order and the
@@ -664,5 +699,61 @@ mod tests {
         );
         let t = &no_null.table;
         assert_eq!(&t.cols()[t.row(1)], [5, 6]); // p q
+    }
+
+    /// A corpus with repeated words, several occurrences per line and lines of varied length.
+    fn varied_corpus() -> Corpus {
+        let mut t = String::new();
+        let mut x = 12345u64;
+        for _ in 0..400 {
+            for side in 0..2 {
+                x = x
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                let n = (x >> 60) as usize;
+                for k in 0..n {
+                    x = x
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    t += &format!(
+                        "{}{} ",
+                        if side == 0 { "s" } else { "t" },
+                        (x >> 59) * (k as u64 % 3)
+                    );
+                }
+                if side == 0 {
+                    t += "||| ";
+                }
+            }
+            t += "\n";
+        }
+        Corpus::from_joined_bytes(t.as_bytes(), &LoadOptions::default()).unwrap()
+    }
+
+    /// Review #12: parts are cut so that their `u32` offsets cannot overflow; the postings
+    /// (and so the table) are the same whatever the cut.
+    #[test]
+    fn postings_do_not_depend_on_the_part_limit() {
+        let c = varied_corpus();
+        let n_vocab = c.vocab.len();
+        let longest = (0..c.len()).map(|k| c.first.line_len(k)).max().unwrap();
+        let cancel = Cancel::default();
+        // one thread: one part unless the limit cuts it
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        let base = pool.install(|| Postings::build(&c.first, n_vocab, &cancel));
+        assert_eq!(base.parts.len(), 1);
+        for limit in [longest, longest + 3, 50, 997] {
+            let p = pool.install(|| Postings::build_with(&c.first, n_vocab, limit, &cancel));
+            assert!(p.parts.len() > base.parts.len());
+            for (_, out) in &p.parts {
+                assert!(out.len() <= limit);
+            }
+            for e in 0..n_vocab as u32 {
+                assert!(base.lines(e).eq(p.lines(e)), "row {e}, limit {limit}");
+            }
+        }
     }
 }

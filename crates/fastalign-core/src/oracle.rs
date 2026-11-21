@@ -11,6 +11,7 @@ use std::io::{self, Write};
 use rustc_hash::FxHashMap;
 
 use crate::align::{align_pair, AlignOptions};
+use crate::cancel::Cancel;
 use crate::corpus::{Corpus, Vocab, NULL_ID};
 use crate::math::{self, G};
 use crate::ttable::{initial_pass, InitialPass, TTable, TableOptions};
@@ -516,6 +517,12 @@ impl TextTable {
     /// Parse `bytes` as fast_align's `DeserializeLogProbsFromText` does, with C++ stream
     /// semantics (fields separated by C whitespace; `e`, `f`, then a number, repeated).
     pub fn parse(bytes: &[u8], vocab: &Vocab) -> Self {
+        Self::parse_with(bytes, vocab, &Cancel::default())
+    }
+
+    /// [`TextTable::parse`], checking `cancel` every [`CANCEL_RECORDS`] records.
+    pub fn parse_with(bytes: &[u8], vocab: &Vocab, cancel: &Cancel) -> Self {
+        cancel.check();
         let mut ids: FxHashMap<&[u8], u32> = FxHashMap::default();
         for id in 1..vocab.len() as u32 {
             ids.insert(vocab.word(id), id);
@@ -533,6 +540,9 @@ impl TextTable {
         // `while (*in)` tests failbit only: a field ending at end of input sets eofbit, and the
         // next `>> e` then fails, re-storing the previous record (records + 1).
         while !s.fail {
+            if loaded % CANCEL_RECORDS == 0 {
+                cancel.check();
+            }
             if let Some(w) = s.word() {
                 e = w;
             }
@@ -654,6 +664,12 @@ impl<'a> CStream<'a> {
     }
 }
 
+/// Text-table records read between two cancellation checks.
+pub const CANCEL_RECORDS: usize = 1 << 16;
+
+/// Lines aligned by [`force_align`] between two cancellation checks.
+pub const CANCEL_FORCE_LINES: usize = 256;
+
 /// Options of forced alignment (the training options that apply, spec §16).
 #[derive(Clone, Debug)]
 pub struct ForceOptions {
@@ -677,10 +693,12 @@ pub enum ForceResult {
 
 /// fast_align's `-f` mode over `corpus` (spec §16). Writes `SRC ||| TGT ||| LINKS ||| LOGPROB`
 /// lines to `out` and the messages to `log` (except `Loaded …`, which the caller prints).
+/// `cancel` is checked every [`CANCEL_FORCE_LINES`] lines (see [`crate::cancel`]).
 pub fn force_align(
     corpus: &Corpus,
     table: &TextTable,
     opts: &ForceOptions,
+    cancel: &Cancel,
     log: &mut dyn Write,
     out: &mut dyn Write,
 ) -> io::Result<ForceResult> {
@@ -689,6 +707,9 @@ pub fn force_align(
     let mut line = Vec::new();
     let mut links = Vec::new();
     for k in 0..corpus.len() {
+        if k % CANCEL_FORCE_LINES == 0 {
+            cancel.check();
+        }
         let lc = k + 1;
         let (first, second) = (corpus.first.line(k), corpus.second.line(k));
         line.clear();
@@ -719,6 +740,7 @@ pub fn force_align(
             p0: opts.p0,
             tension: opts.tension,
             mean_srclen_multiplier: opts.mean_srclen_multiplier,
+            training_argmax: false,
         };
         links.clear();
         let lp = align_pair(&|e, f| table.prob(e, f), first, second, &aopts, &mut links)
@@ -742,7 +764,7 @@ mod tests {
     use crate::corpus::LoadOptions;
 
     fn corpus(text: &[u8]) -> Corpus {
-        Corpus::from_joined_bytes(text, &LoadOptions::default())
+        Corpus::from_joined_bytes(text, &LoadOptions::default()).unwrap()
     }
 
     #[test]

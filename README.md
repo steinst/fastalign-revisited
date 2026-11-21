@@ -8,14 +8,14 @@ Chahuneau and Smith 2013) in Rust, with Python bindings and a native command-lin
   includes the `-s` scores, the `-p` probability tables, the statistics fast_align prints, and
   the symmetrisation heuristics of `atools`.
 * **Faster, and deterministic at any thread count.** About 5.4× faster than fast_align + `atools`
-  on a 1.1M-sentence corpus, in under half the memory (see [Results](#results)). fast_align itself
+  on a 1.1M-sentence corpus, in about half the memory (1.5 GB against fast_align's 3.0 GB for one direction) (see [Results](#results)). fast_align itself
   gives different output with more than one thread; this tool does not.
 * **A model you can keep.** Train once, save, then align new sentences with the saved model
   (fast_align has no such mode other than re-reading its text table).
 * **Optional subword alignment**, which helps morphologically rich languages (see
   [Subword alignment](#subword-alignment)).
 
-Version 0.1.0, not released on PyPI (build it from this repository). Sister project: *gizapp*
+Version 0.2.0, not released on PyPI (build it from this repository). Sister project: *gizapp*
 (giza++ revisited), which has the same command line and Python API shape for GIZA++.
 
 ## Install
@@ -55,7 +55,10 @@ model.align_many("new.en", "new.fr", symmetrize="union").write("new.align")
 
 Other ways to give the corpus: one file of `source ||| target` lines
 (`fastalign.train("corpus.en-fr")`), or lists of sentences, each a string or a list of tokens
-(`fastalign.train(src_sentences, tgt_sentences)`).
+(`fastalign.train(src_sentences, tgt_sentences)`). Words are separated by spaces and tabs. In a
+`source ||| target` file a tab also separates the sides, exactly as in fast_align; with two files
+each file is one side, and a tab or `|||` inside a line stays on that side. Pipes and process
+substitutions work as file names; on the command line `-` is standard input.
 
 `train` takes fast_align's options by name: `iterations` (`-I`), `diagonal` (`-d`),
 `optimize_tension` (`-o`), `variational_bayes` (`-v`), `alpha` (`-a`), `tension` (`-T`), `p0`
@@ -77,7 +80,7 @@ get word alignments back. The output stays word-level Pharaoh, and the default i
 ```python
 import fastalign
 
-# trains a SentencePiece tokeniser on the corpus (pip install 'fastalign[subword]'):
+# trains a SentencePiece tokeniser on the corpus (pip install 'fastalign-revisited[subword]'):
 # BPE, one joint model of 8000 pieces
 model = fastalign.train("corpus.en", "corpus.fr", subword="auto")
 model.write_alignments("subword.align")                # word links, not piece links
@@ -105,7 +108,7 @@ fastalign export-table en-fr.fastalign --direction fwd -o fwd.table
 ```
 
 The Python console script and the native binary (`cargo build --release`, then
-`target/release/fastalign`) take the same subcommands and options; the flag mapping from
+`target/release/fastalign`) take the same subcommands and options; flag mapping from
 fast_align is [below](#fast_align-flags-and-their-equivalents).
 
 ## Fast_align flags and their equivalents
@@ -127,6 +130,25 @@ fast_align is [below](#fast_align-flags-and-their-equivalents).
 Unlike fast_align the tool does not drop long sentences by default (`--max-len` does; dropping
 lines changes the result), and the default is fast_align's recommended `-d -o -v` with 5
 iterations in both directions.
+
+### Empty sides and other degenerate input
+
+fast_align trains on a line pair with an empty side, and that pair changes the results of **all
+the other pairs**: one empty *source* side makes the forward direction's mean length ratio
+infinite and, with tension optimisation, its tension NaN, so the forward direction aligns no
+line at all; one blank line makes the ratio NaN and every `-s` score NaN. This tool does the same
+by default (it is a drop-in), and says so: training that ends with nonfinite parameters prints a
+`fastalign: warning:` line (Python: a `RuntimeWarning`, also in `Model.training_warnings`)
+naming the empty-sided lines; the `--log` statistics stay fast_align's. Pass `--empty-pairs skip`
+(`empty_pairs="skip"`) to drop such pairs before training (each keeps an empty output line, the
+rest is what fast_align gives on the file without them), or `--empty-pairs error` to refuse
+them with their line numbers.
+
+An empty input trains nothing and writes nothing (as fast_align); an input whose every line is
+dropped writes one empty line per input line; both warn. `-I 0` decodes nothing and writes no
+lines. A model trained with `-I 1` has no estimated probabilities (its exported table is all
+`-inf`, as fast_align's) and aligns new text from the alignment prior alone, as the training
+run did. The starting tension must not be 0 (the diagonal prior is then 0/0).
 
 ## Results
 
@@ -162,7 +184,11 @@ about 230 configurations, paired bootstrap over the gold sentences):
 | English-French, 1,130,551 lines | 15.29 | 15.52 | +0.23, within noise |
 
 So: use it for morphologically rich languages, leave it off for English-French. On the large
-corpus it costs about 1.1× the time and uses less memory.
+corpus the alignment step on the prepared pieces takes about 1.1× the time of the word-level
+run and a similar amount of memory (1.33 against 1.56 GB peak); training the tokeniser, encoding
+and projecting come on top (the tokeniser alone took 12.5 s on 1.1M lines). End to end on the
+100,447-line English-French medium corpus (both directions, three word-alignment files, 20
+threads) one run took 7.1 s and 505 MB with `subword="auto"` against 3.1 s and 470 MB for words.
 
 ## Parity
 

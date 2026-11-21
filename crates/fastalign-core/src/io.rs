@@ -30,27 +30,35 @@
 //!
 //! New sentences are mapped to the model's vocabulary by word bytes. Words the model does not
 //! know, and pairs it has no cell for, have probability `1e-9`, as in fast_align's `-f` mode.
-//! The alignment of the training corpus itself is reproduced byte for byte (for `-I` ≥ 2; with
-//! `-I 1` the table is all zero, as in fast_align's `-p` export).
+//! The alignment of the training corpus itself is reproduced byte for byte, also with `-I 1`:
+//! the stored table is then all zero (as fast_align's `-p` export, which stays so), and
+//! inference uses training's uninitialised `1e-9` for every pair, as the training decode did
+//! ([`ModelOptions::estimated`]). The argmax starts as in training's decode
+//! ([`AlignOptions::training_argmax`]).
 
 use std::fmt;
 use std::fs::File;
-use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::io::{self, BufReader, Read, Write};
 use std::path::Path;
+use std::sync::OnceLock;
 
 use rayon::prelude::*;
-use rustc_hash::FxHashMap;
+use rustc_hash::FxHasher;
 
 use crate::align::{align_pair, AlignOptions};
+use crate::cancel::Cancel;
 use crate::corpus::{Corpus, Vocab};
 use crate::math;
 use crate::oracle::{TrainOptions, UNINITIALISED_PROB};
-use crate::subword::Boundary;
+use crate::subword::{project_links, Boundary, LinkOrder};
 use crate::symmetrize::{format_links, Link};
 use crate::train::{write_text_table, TrainerParts};
 use crate::ttable::TTable;
 
 const MAGIC: &[u8; 8] = b"FASTALGN";
+
+/// Lines per parallel task of [`Model::align_corpus`] (one cancellation check each).
+pub const CANCEL_ALIGN_LINES: usize = 2048;
 const END: &[u8; 8] = b"ENDFALGN";
 /// Current model file format version.
 pub const FORMAT_VERSION: u32 = 2;
@@ -143,7 +151,16 @@ impl ModelOptions {
             p0: self.p0,
             tension: self.tension,
             mean_srclen_multiplier: self.mean_srclen_multiplier,
+            training_argmax: true,
         }
+    }
+
+    /// Whether training ran an M-step (`iterations` ≥ 2). Without one the stored probabilities
+    /// are fast_align's never-estimated zeros (what the `-p` export writes), while training
+    /// decoded with its uninitialised value `1e-9` for every pair; inference then uses `1e-9`
+    /// too, so it reproduces the training alignments.
+    pub fn estimated(&self) -> bool {
+        self.iterations >= 2
     }
 }
 
@@ -157,6 +174,18 @@ pub struct DirModel {
 }
 
 impl DirModel {
+    /// This direction's table in fast_align's `-p` text format (`vocab` is the model's
+    /// vocabulary), checking `cancel` per chunk of rows.
+    pub fn write_table(
+        &self,
+        vocab: &Vocab,
+        beam_threshold: f64,
+        cancel: &Cancel,
+        w: &mut dyn Write,
+    ) -> std::io::Result<()> {
+        write_text_table(&self.table, &self.probs, vocab, beam_threshold, cancel, w)
+    }
+
     /// Package a finished trainer.
     pub fn from_trainer(parts: TrainerParts, reverse: bool) -> Self {
         let o: &TrainOptions = &parts.opts;
@@ -198,11 +227,15 @@ pub struct SubwordInfo {
 /// A trained model: the shared vocabulary and one or both directions.
 #[derive(Clone, Debug)]
 pub struct Model {
+    /// The vocabulary. Do not change it once the model has aligned text: the word index
+    /// ([`Model::word_index`]) is built from it on first use and kept.
     pub vocab: Vocab,
     pub fwd: Option<DirModel>,
     pub inv: Option<DirModel>,
     /// Set when the vocabulary holds subword pieces (see [`SubwordInfo`]).
     pub subword: Option<SubwordInfo>,
+    /// Word bytes → id, built once on first use and shared by every alignment call.
+    index: OnceLock<WordIndex>,
 }
 
 fn w_u32s(w: &mut dyn Write, v: &[u32]) -> io::Result<()> {
@@ -313,6 +346,7 @@ impl Model {
             fwd,
             inv,
             subword: None,
+            index: OnceLock::new(),
         }
     }
 
@@ -383,10 +417,7 @@ impl Model {
 
     /// Save to a file.
     pub fn save(&self, path: &Path) -> Result<(), ModelError> {
-        let mut w = BufWriter::with_capacity(1 << 20, File::create(path)?);
-        self.write(&mut w)?;
-        w.flush()?;
-        Ok(())
+        Ok(crate::atomic::write_with(path, |w| self.write(w))?)
     }
 
     /// Load from a file.
@@ -423,8 +454,9 @@ impl Model {
             words.push(r.bytes(l)?);
         }
         let vocab = Vocab::from_words(words.iter().map(Vec::as_slice));
-        if vocab.word(1) != b"<eps>" {
-            return bad("the model file is corrupt (vocabulary)");
+        // reserved ids (corpus.rs): 0 `<bad0>`, 1 `<eps>`, 2 `|||`
+        if vocab.word(0) != b"<bad0>" || vocab.word(1) != b"<eps>" || vocab.word(2) != b"|||" {
+            return bad("the model file is corrupt (reserved vocabulary entries)");
         }
         let mut dirs = Vec::new();
         for _ in 0..2 {
@@ -449,12 +481,9 @@ impl Model {
                 return bad("the model file is corrupt (direction)");
             }
         }
-        Ok(Model {
-            vocab,
-            fwd,
-            inv,
-            subword,
-        })
+        let mut model = Model::new(vocab, fwd, inv);
+        model.subword = subword;
+        Ok(model)
     }
 
     fn read_subword<R: Read>(r: &mut Rd<R>) -> Result<Option<SubwordInfo>, ModelError> {
@@ -473,6 +502,10 @@ impl Model {
         let boundary = Boundary::from_parts(kind, &marker)
             .map_err(|e| ModelError::Format(format!("the model file is corrupt ({e})")))?;
         let n_models = r.u32()?;
+        // one joint tokeniser, or source then target (an empty blob is a side left as words)
+        if n_models > 2 {
+            return bad("the model file is corrupt (tokeniser count)");
+        }
         if u64::from(n_models) * 8 > r.left {
             return bad("the model file is truncated or corrupt");
         }
@@ -526,60 +559,108 @@ impl Model {
         })?;
         let order = r.vec(cells, 4, u32le)?;
         let buckets = r.vec(rows, 8, |b| u64::from_le_bytes(b.try_into().unwrap()))?;
+        // every source row that holds cells names a word of the vocabulary (the exporter and
+        // the aligner index the vocabulary by row); id 0 is never a source or a target
+        if rows > vocab_len as u64 {
+            let first_extra = vocab_len;
+            if row_ptr
+                .get(first_extra)
+                .is_none_or(|&s| s != *row_ptr.last().unwrap())
+            {
+                return bad("the model file is corrupt (a source row has no vocabulary entry)");
+            }
+        }
+        if row_ptr.get(1).is_some_and(|&e| e != 0) {
+            return bad("the model file is corrupt (cells for the reserved word 0)");
+        }
+        if cols.contains(&0) {
+            return bad("the model file is corrupt (reserved target id 0)");
+        }
         let table = TTable::from_parts(row_ptr, cols, order, buckets, vocab_len)
             .map_err(|e| ModelError::Format(format!("the model file is corrupt ({e})")))?;
         Ok(DirModel { opts, table, probs })
     }
 
-    /// Write direction `d`'s conditional probability table in fast_align's `-p` text format.
+    /// Write direction `d`'s conditional probability table in fast_align's `-p` text format,
+    /// checking `cancel` per chunk of rows (see [`crate::cancel`]).
     pub fn write_table(
         &self,
         d: Direction,
         beam_threshold: f64,
+        cancel: &Cancel,
         w: &mut dyn Write,
     ) -> Result<(), ModelError> {
         let dm = self.dir(d).ok_or_else(|| {
             ModelError::Unsupported(format!("the model has no {} direction", d.name()))
         })?;
-        write_text_table(&dm.table, &dm.probs, &self.vocab, beam_threshold, w)?;
+        dm.write_table(&self.vocab, beam_threshold, cancel, w)?;
         Ok(())
     }
 
-    /// Word bytes → model id, for mapping new text.
-    pub fn word_index(&self) -> WordIndex<'_> {
-        let mut map = FxHashMap::default();
-        for id in 1..self.vocab.len() as u32 {
-            map.insert(self.vocab.word(id), id);
-        }
-        WordIndex { map }
+    /// The index of the vocabulary (word bytes → id), built on first use and kept for the life
+    /// of the model; concurrent first users wait for one build.
+    pub fn word_index(&self) -> &WordIndex {
+        self.index.get_or_init(|| WordIndex::new(&self.vocab))
+    }
+
+    /// The model id of a word, if the model knows it.
+    pub fn word_id(&self, w: &[u8]) -> Option<u32> {
+        self.word_index().get(&self.vocab, w)
+    }
+
+    /// Map a corpus to this model's ids (once, for any number of directions): see
+    /// [`MappedCorpus`].
+    pub fn map_corpus<'c>(&self, corpus: &'c Corpus) -> MappedCorpus<'c> {
+        let index = self.word_index();
+        let ids = (0..corpus.vocab.len() as u32)
+            .into_par_iter()
+            .with_min_len(4096)
+            .map(|id| {
+                if id == 0 {
+                    UNKNOWN
+                } else {
+                    index
+                        .get(&self.vocab, corpus.vocab.word(id))
+                        .unwrap_or(UNKNOWN)
+                }
+            })
+            .collect();
+        MappedCorpus { corpus, ids }
     }
 
     /// Forced alignment of every line of `corpus` (read with the same tokenisation as training)
     /// in direction `d`, as Pharaoh text, one line per corpus line. With `scores`, each line
     /// ends with ` ||| ` and the log score. Lines with an empty side give an empty alignment.
+    /// `cancel` is checked per chunk of [`CANCEL_ALIGN_LINES`] lines (see [`crate::cancel`]).
+    /// To align a corpus in both directions, map it once with [`Model::map_corpus`] and use
+    /// [`Model::align_mapped`].
     pub fn align_corpus(
         &self,
         corpus: &Corpus,
         d: Direction,
         scores: bool,
+        cancel: &Cancel,
     ) -> Result<Vec<u8>, ModelError> {
+        cancel.check();
+        self.align_mapped(&self.map_corpus(corpus), d, scores, cancel)
+    }
+
+    /// [`Model::align_corpus`] of a corpus already mapped to this model.
+    pub fn align_mapped(
+        &self,
+        mapped: &MappedCorpus<'_>,
+        d: Direction,
+        scores: bool,
+        cancel: &Cancel,
+    ) -> Result<Vec<u8>, ModelError> {
+        cancel.check();
         let dm = self.dir(d).ok_or_else(|| {
             ModelError::Unsupported(format!("the model has no {} direction", d.name()))
         })?;
-        let index = self.word_index();
-        let map: Vec<u32> = (0..corpus.vocab.len() as u32)
-            .map(|id| {
-                let w = corpus.vocab.word(id);
-                if id == 0 {
-                    UNKNOWN
-                } else {
-                    index.map.get(w).copied().unwrap_or(UNKNOWN)
-                }
-            })
-            .collect();
+        let (corpus, map) = (mapped.corpus, &mapped.ids[..]);
         let aopts = dm.opts.align_options();
-        let prob = |e: u32, f: u32| lookup(dm, &map, e, f);
-        const CHUNK: usize = 2048;
+        let prob = |e: u32, f: u32| lookup(dm, map, e, f);
+        const CHUNK: usize = CANCEL_ALIGN_LINES;
         let n = corpus.len();
         let starts: Vec<usize> = (0..n).step_by(CHUNK).collect();
         let window = 4 * rayon::current_num_threads();
@@ -587,8 +668,9 @@ impl Model {
         for win in starts.chunks(window) {
             let texts: Vec<Vec<u8>> = win
                 .par_iter()
+                .panic_fuse()
                 .map(|&s| {
-                    crate::cancel::check();
+                    cancel.check();
                     let mut buf = Vec::new();
                     let mut links = Vec::new();
                     for k in s..(s + CHUNK).min(n) {
@@ -627,22 +709,36 @@ impl Model {
         corpus: &Corpus,
         d: Direction,
         scores: bool,
+        cancel: &Cancel,
     ) -> Result<Vec<u8>, ModelError> {
-        let raw = self.align_corpus(corpus, d, scores)?;
+        cancel.check();
+        self.align_words_mapped(&self.map_corpus(corpus), d, scores, cancel)
+    }
+
+    /// [`Model::align_words`] of a corpus already mapped to this model.
+    pub fn align_words_mapped(
+        &self,
+        mapped: &MappedCorpus<'_>,
+        d: Direction,
+        scores: bool,
+        cancel: &Cancel,
+    ) -> Result<Vec<u8>, ModelError> {
+        let raw = self.align_mapped(mapped, d, scores, cancel)?;
         match &self.subword {
             None => Ok(raw),
-            Some(sw) => crate::subword::project_text(corpus, &sw.boundary, &raw, d.reverse())
-                .map_err(ModelError::Unsupported),
+            Some(sw) => {
+                crate::subword::project_text(mapped.corpus, &sw.boundary, &raw, d.reverse(), cancel)
+                    .map_err(ModelError::Unsupported)
+            }
         }
     }
 
-    /// Forced alignment of one sentence pair given as tokens (bytes). Returns the links
-    /// `(first index, second index)` in increasing target position and the log score; `None`
-    /// if a side is empty.
+    /// Forced alignment of one sentence pair given as tokens (bytes; pieces for a subword
+    /// model). Returns the links `(first index, second index)` in increasing target position and
+    /// the log score; `None` if a side is empty. Uses the model's word index, no corpus.
     pub fn align_tokens(
         &self,
         d: Direction,
-        index: &WordIndex<'_>,
         first: &[&[u8]],
         second: &[&[u8]],
     ) -> Result<Option<(Vec<Link>, f64)>, ModelError> {
@@ -651,7 +747,7 @@ impl Model {
         })?;
         let ids = |ws: &[&[u8]]| -> Vec<u32> {
             ws.iter()
-                .map(|w| index.map.get(w).copied().unwrap_or(UNKNOWN))
+                .map(|w| self.word_id(w).unwrap_or(UNKNOWN))
                 .collect()
         };
         let (a, b) = (ids(first), ids(second));
@@ -659,16 +755,118 @@ impl Model {
         let ident = |e: u32, f: u32| lookup_ids(dm, e, f);
         Ok(align_pair(&ident, &a, &b, &dm.opts.align_options(), &mut links).map(|lp| (links, lp)))
     }
+
+    /// The links of one sentence pair exactly as line 1 of [`Model::align_words`] on a one-line
+    /// corpus of these tokens gives them, without building a corpus or text: for a subword model
+    /// the piece links projected to words (forward direction ordered by (second, first) word,
+    /// inverse by (first, second)), otherwise the links in increasing target position. An empty
+    /// side gives no links.
+    pub fn align_tokens_words(
+        &self,
+        d: Direction,
+        first: &[&[u8]],
+        second: &[&[u8]],
+    ) -> Result<Vec<Link>, ModelError> {
+        let Some((links, _)) = self.align_tokens(d, first, second)? else {
+            return Ok(Vec::new());
+        };
+        let Some(sw) = &self.subword else {
+            return Ok(links);
+        };
+        let (mut fm, mut sm, mut out) = (Vec::new(), Vec::new(), Vec::new());
+        let b = &sw.boundary;
+        b.word_map_marks(first.iter().map(|w| b.marks(w)), &mut fm);
+        b.word_map_marks(second.iter().map(|w| b.marks(w)), &mut sm);
+        project_links(&links, &fm, &sm, LinkOrder::of(d.reverse()), &mut out)
+            .map_err(ModelError::Unsupported)?;
+        Ok(out)
+    }
 }
 
-/// Word bytes → model id (see [`Model::word_index`]).
-pub struct WordIndex<'m> {
-    map: FxHashMap<&'m [u8], u32>,
+/// A corpus mapped to a model's ids by [`Model::map_corpus`]: one lookup per distinct word of
+/// the corpus, shared by both directions. Use it only with the model that made it.
+pub struct MappedCorpus<'c> {
+    corpus: &'c Corpus,
+    /// Corpus id → model id ([`UNKNOWN`] for words the model does not know, and for id 0).
+    ids: Vec<u32>,
+}
+
+impl MappedCorpus<'_> {
+    /// The corpus.
+    pub fn corpus(&self) -> &Corpus {
+        self.corpus
+    }
+}
+
+/// Word bytes → id of a [`Vocab`] (see [`Model::word_index`]): an open-addressing table that
+/// holds only ids (the words stay in the vocabulary), 8–16 bytes per word.
+#[derive(Clone, Debug)]
+pub struct WordIndex {
+    /// Ids or [`EMPTY_SLOT`]; a power of two, at most half full.
+    slots: Vec<u32>,
+    /// `64 - log2(slots.len())`: the top bits of the mixed hash pick the slot.
+    shift: u32,
+}
+
+const EMPTY_SLOT: u32 = u32::MAX;
+
+impl WordIndex {
+    /// Index the ids `1..` of `vocab` (id 0 is never a word). A word that occurs twice (only in
+    /// a corrupt file) maps to its last id, as a map filled in id order would.
+    pub fn new(vocab: &Vocab) -> Self {
+        let n = vocab.len();
+        let cap = (2 * n).max(2).next_power_of_two();
+        let shift = 64 - cap.trailing_zeros();
+        let mut slots = vec![EMPTY_SLOT; cap];
+        let mask = cap - 1;
+        for id in 1..n as u32 {
+            let w = vocab.word(id);
+            let mut i = Self::slot(w, shift);
+            loop {
+                let s = slots[i];
+                if s == EMPTY_SLOT || vocab.word(s) == w {
+                    slots[i] = id;
+                    break;
+                }
+                i = (i + 1) & mask;
+            }
+        }
+        WordIndex { slots, shift }
+    }
+
+    #[inline]
+    fn slot(w: &[u8], shift: u32) -> usize {
+        use std::hash::Hasher;
+        let mut h = FxHasher::default();
+        h.write(w);
+        (h.finish().wrapping_mul(0x9e37_79b9_7f4a_7c15) >> shift) as usize
+    }
+
+    /// The id of `w` in `vocab`, which must be the vocabulary the index was built from.
+    pub fn get(&self, vocab: &Vocab, w: &[u8]) -> Option<u32> {
+        let mask = self.slots.len() - 1;
+        let mut i = Self::slot(w, self.shift);
+        loop {
+            let s = self.slots[i];
+            if s == EMPTY_SLOT {
+                return None;
+            }
+            if (s as usize) < vocab.len() && vocab.word(s) == w {
+                return Some(s);
+            }
+            i = (i + 1) & mask;
+        }
+    }
+
+    /// Heap bytes used.
+    pub fn memory_bytes(&self) -> usize {
+        self.slots.capacity() * 4
+    }
 }
 
 #[inline]
 fn lookup_ids(dm: &DirModel, e: u32, f: u32) -> f64 {
-    if e == UNKNOWN || f == UNKNOWN {
+    if e == UNKNOWN || f == UNKNOWN || !dm.opts.estimated() {
         return UNINITIALISED_PROB;
     }
     dm.table
@@ -679,23 +877,6 @@ fn lookup_ids(dm: &DirModel, e: u32, f: u32) -> f64 {
 #[inline]
 fn lookup(dm: &DirModel, map: &[u32], e: u32, f: u32) -> f64 {
     lookup_ids(dm, map[e as usize], map[f as usize])
-}
-
-/// Remove ` ||| score` suffixes from Pharaoh lines (output made with scores), leaving links.
-pub fn strip_scores(text: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(text.len());
-    for line in text.split_inclusive(|&b| b == b'\n') {
-        let body = line.strip_suffix(b"\n").unwrap_or(line);
-        let cut = body
-            .windows(5)
-            .position(|w| w == b" ||| ")
-            .unwrap_or(body.len());
-        out.extend_from_slice(&body[..cut]);
-        if line.ends_with(b"\n") {
-            out.push(b'\n');
-        }
-    }
-    out
 }
 
 #[cfg(test)]
@@ -792,7 +973,7 @@ mod tests {
             let mut m = tiny();
             m.subword = Some(SubwordInfo {
                 boundary,
-                tokenizers: vec![b"model-one".to_vec(), Vec::new(), vec![0, 255, 7]],
+                tokenizers: vec![b"model-one".to_vec(), vec![0, 255, 7]],
                 settings: b"{\"a\": 1}".to_vec(),
             });
             let mut bytes = Vec::new();
@@ -824,28 +1005,65 @@ mod tests {
     }
 
     #[test]
-    fn strip_scores_keeps_links() {
-        assert_eq!(
-            strip_scores(b"0-0 1-1 ||| -3.5\n ||| -2\n0-1\n"),
-            b"0-0 1-1\n\n0-1\n"
-        );
+    fn loader_rejects_broken_invariants() {
+        let bytes_of = |m: &Model| {
+            let mut b = Vec::new();
+            m.write(&mut b).unwrap();
+            b
+        };
+        let load = |b: &[u8]| Model::read(b, b.len() as u64);
+        // more than two tokenisers
+        let mut m = tiny();
+        m.subword = Some(SubwordInfo {
+            boundary: Boundary::sentencepiece(),
+            tokenizers: vec![vec![1], vec![2], vec![3]],
+            settings: vec![],
+        });
+        assert!(load(&bytes_of(&m)).is_err());
+        // a source row with cells but no vocabulary entry
+        let mut m = tiny();
+        let dm = m.fwd.as_mut().unwrap();
+        let n = m.vocab.len();
+        let mut rp = dm.table.row_ptr().to_vec();
+        let cells = *rp.last().unwrap();
+        while rp.len() <= n + 1 {
+            rp.push(cells);
+        }
+        *rp.last_mut().unwrap() = cells + 1;
+        let mut cols = dm.table.cols().to_vec();
+        cols.push(2);
+        let order: Vec<u32> = dm.table.order().chain([0]).collect();
+        let mut buckets = dm.table.buckets().to_vec();
+        buckets.resize(rp.len() - 1, 1);
+        dm.table = TTable::from_parts(rp, cols, order, buckets, n).unwrap();
+        dm.probs.push(0.5);
+        assert!(load(&bytes_of(&m)).is_err());
+        // reserved vocabulary entries
+        let m = tiny();
+        let mut b = bytes_of(&m);
+        let at = b.windows(5).position(|w| w == b"<eps>").unwrap();
+        b[at] = b'X';
+        assert!(load(&b).is_err());
     }
 
     #[test]
     fn aligns_tokens_with_unknown_words() {
         let m = tiny();
-        let idx = m.word_index();
         let (links, _) = m
-            .align_tokens(Direction::Forward, &idx, &[b"a"], &[b"x", b"zzz"])
+            .align_tokens(Direction::Forward, &[b"a"], &[b"x", b"zzz"])
             .unwrap()
             .unwrap();
         assert_eq!(links[0], (0, 0));
         assert!(m
-            .align_tokens(Direction::Forward, &idx, &[], &[b"x"])
+            .align_tokens(Direction::Forward, &[], &[b"x"])
             .unwrap()
             .is_none());
         assert!(m
-            .align_tokens(Direction::Inverse, &idx, &[b"a"], &[b"x"])
+            .align_tokens(Direction::Inverse, &[b"a"], &[b"x"])
             .is_err());
+        assert!(m
+            .align_tokens_words(Direction::Forward, &[b"a"], &[])
+            .unwrap()
+            .is_empty());
     }
 }

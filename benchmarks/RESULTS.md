@@ -2,6 +2,37 @@
 
 Step 9b's results come first; the Step 9a measurements (before any optimisation) follow unchanged.
 
+## Step 24: saved-model inference (2026-11-20)
+
+`benchmarks/infer_latency.py` (the review's case: a two-iteration model on distinct one-word
+pairs, saved and loaded; 128 `Model.align` calls vs one `align_many` of 128 lines; median of 3,
+`quiet_run --idle-cpus 1.5`, other_cpus 0.15–0.63), ms for all 128 queries:
+
+| model | words | before: align / align_many | after: align / align_many | after, per-query ratio |
+|---|---:|---:|---:|---:|
+| fwd only (the review's) | 200 | 4.02 / 0.23 | 0.135 / 0.179 | 0.76 |
+| fwd only (the review's) | 40,000 | 131.5 / 1.36 | 0.135 / 0.204 | 0.66 |
+| both, gdfa | 40,000 | 288.5 / 2.76 | 0.138 / 0.195 | 0.71 |
+| both + joint tokeniser, gdfa | 40,000 | 9.20 / 0.51 | 0.225 / 0.367 | 0.61 |
+| same, 128 distinct queries (`--distinct`) | 40,000 | – | 0.299 / 1.317 | 0.23 |
+
+Target (align per query within 2× of align_many's): met everywhere. Before, every call rebuilt a
+hash map of the whole vocabulary per direction, started a thread and went through Pharaoh text;
+now the index is built once per model and one pair is aligned directly. A first version without
+a model-level tokeniser cache gave 2.6× for the subword model (SentencePiece costs 2 µs per word,
+the binding 0.56 µs per pair), hence the bounded 16,384-word cache for `align`.
+
+`benchmarks/subword_memory.py` (joint tokeniser, 10 batches of 8,000 never-seen words through
+`align_many` lists): before, the segmenter cache grew by 16,000 entries per batch (160,000 at
+the end), traced Python memory 6.8 → 82.8 MB, RSS 83 → 294 MB; after, nothing is cached
+between calls (traced memory flat, RSS 52 → 58 MB). Through `Model.align`: cache ≤ 16,384
+entries, traced ≈ 7–8.6 MB, RSS flat at 69 MB. Outputs equal a cold model's.
+
+Native `align MODEL -s grow-diag-final-and -t 20` on en-fr large (1.12 GB model, corpus mapped
+once for both directions now): 7.12/7.21/7.22 s before, 7.12/7.25/7.27 s after, peak RSS
+1.83–1.88 GB both, interleaved; other_cpus 0.67–0.94 (busier than the 9b cutoff), so only "no
+change" is claimed. Output identical to the fwd/rev/gdfa goldens.
+
 ## Step 9b, third session (2026-11-19)
 
 Commits `97c5928`, `1927524`, `b661264` and the narrow hash order (PERF-TODO 7) on top of
@@ -422,3 +453,217 @@ its cache, and for the same reason (`PERF-TODO.md` 1–2). gizapp's binary searc
 inclusive; here it is 57 % of the E-step, with the probability load another 35 %.
 
 The ranked optimisation list is `PERF-TODO.md`.
+
+## Step 25: copies, thread budget, early release
+
+en-fr large (1,130,551 lines), 20 threads, `benchmarks/step25_memory.py` (one process per scenario
+under `/usr/bin/time`; `other_cpus` 0.5–1.1 on the shared desktop, one run each, so wall times
+differ by noise only). *before* = commit c536eb2 (Step 24), *after* = this step. Peak RSS in MB.
+
+| scenario | before | after |
+|---|---|---|
+| native `train -o` (alignments only) | 1497 | 1477 |
+| native `train --table` | **1974** | **1472** |
+| native `train --save` | 1993 | 1938 |
+| native `train --table --save` | 1990 | 1952 |
+| native `train -s gdfa` | 1535 | 1480 |
+| native `export-table` from a saved model | 1082 | 1082 |
+| native `symmetrize` (files) | 360 | 363 |
+| Python API `train` + 3 × `write_alignments` | 1973 | 1959 |
+| Python CLI `train -o` | 1965 | 1487 |
+| Python CLI `train --table` | **1956** | **1496** |
+| Python CLI `train --save` | 1956 | 1945 |
+| Python CLI `export-table` | 1099 | 1099 |
+| Python CLI `symmetrize` | 449 | 449 |
+
+Wall times are unchanged (12.7–13.5 s for every training scenario in both builds).
+
+* Gain: a table-writing job no longer holds a finished direction's model while the other trains
+  (`pipeline::train_with_sink`: the sink writes the table into a staged file, the model is dropped
+  and the heap trimmed before the next direction). −0.5 GB. A job that needs both models
+  (`--save`, the Python API) is unchanged, by design.
+* Not a gain here: directional `write_alignments`, the Python CLI's file output, streaming of
+  `write_table` and the projection flush save one text-sized copy each (≈ 100–250 MB of alignment
+  text on this corpus), which is below the training peak, so they do not move the peak of these
+  scenarios; they matter for a loaded model's export and for corpora where text dominates.
+  Not measured separately.
+* Worker threads (`-t 3`, max OS threads of the process, sampled every 10 ms): native `train`
+  (including the corpus load; `-I 0`) 24 → **4** (3 workers + the main thread); `export-table`
+  24 → 4; `align` of a model 24 → 4.
+
+## Step 26: sparse grow-diag, bounded line scratch
+
+### Grow-diag (review performance item 4)
+
+Native `symmetrize` on the en-fr large golden alignments (1,130,551 lines), `benchmarks/symmetrize_time.py`
+(`quiet_run`, builds interleaved, every output byte-identical to atools' golden). *old* = Step 25's
+dense grid over `[0, max i] × [0, max j]`, *new* = this step. Median of 3, wall s (runs with
+other_cpus > 5 dropped from the median where a clean run of the same cell exists).
+
+| method | threads | old | new | peak MB old → new |
+|---|---|---|---|---|
+| grow-diag | 1 | 3.26 | 2.80–2.92 | 245 → 245 |
+| grow-diag | 20 | 0.39 | 0.37 | 358 → 347 |
+| grow-diag-final | 1 | 3.50 | 3.04 | 246 → 246 |
+| grow-diag-final | 20 | 0.42 | 0.39 | 377 → 367 |
+| grow-diag-final-and | 1 | 3.38 | 2.97 | 245 → 245 |
+| grow-diag-final-and | 20 | 0.40 | 0.38 | 361 → 351 |
+
+Short dense sentences are 7–13 % faster (one merge instead of sort + binary-search intersection, a
+grid over the bounding box only, emission from the union instead of a scan of the grid). A line with
+one common link at `(20000, 20000)`, which the old build refused ("alignment indices are too large"),
+now gives atools' output; atools itself takes 4–5 s and 296 MB for that file (a 20001² grid).
+
+### Line probability scratch (review performance item 8)
+
+`benchmarks/long_lines.py`: 40 pairs × 3000 tokens per side, `phases seq -d -o -v -b 1`,
+`FA_GROUP_LINES=1` (one line per phase-A task). *distinct*: every line a permutation of the same
+3000 words per side (3000 × 3000 matrix per line = 69 MiB); *repeated*: 40 words per side. Median
+of 3, outputs identical across all runs of a corpus.
+
+| corpus | threads | no cap (old): wall s / peak MB | cap 2²⁰ cells (default): wall s / peak MB |
+|---|---|---|---|
+| distinct | 20 | 5.39 / 1651 | 6.70 / 426 |
+| distinct | 1 | 56.66 / 340 | 54.13 / 271 |
+| repeated | 20 | 1.95 / 7 | 1.93 / 7 |
+| repeated | 1 | 24.78 / 6 | 24.72 / 6 |
+
+Cap sweep, distinct, 20 threads, one run each: 2¹⁸ 7.71 s / 342 MB, 2²⁰ 6.42 s / 429 MB,
+2²² 5.28 s / 916 MB, none 5.41 s / 1650 MB. The default 2²⁰ (8 MiB per worker) was chosen by the
+user. The 20-thread cost (+24 %) is inherent to target tiles: every tile re-reads all source rows of
+the line from a table that no longer fits in cache; at one thread it is not measurable. Lines whose
+matrix fits (all of en-fr large) take the unchanged path.
+
+## Step 27: trainer experiments (review performance items 7 and 6)
+
+`benchmarks/trainer_bench.py` (interleaved `phases seq` runs of several builds/settings, each
+under `quiet_run --idle-cpus 1.5` and `timed_run`; 1-thread runs pinned to P-core 2; outputs
+of every run compared byte for byte with the first run of the corpus and, on en-fr large, with
+the golden fwd/rev/gdfa) and `benchmarks/trainer_summary.py` (medians). Three repetitions per
+cell; times are **both directions summed**, seconds; peak RSS of the whole `phases` run (MB).
+Corpora (`benchmarks/trainer_corpora.py`, seed 27, `-d -o -v`):
+
+- **en-fr large** (1,130,551 lines, default `-b`).
+- **short-hv**: 1,000,000 synthetic pairs of 1–6 tokens over a Zipf vocabulary of 1M types per
+  side: many tiny phase-A tasks and phase-B rows, vocabulary-sized scratch large against the work.
+- **long-rep**: 4,000 synthetic pairs of 150–300 tokens over 3,000 types per side, `-b 100`.
+  With the default 4,096-line groups all 40 buffers form one phase-A task, so its E-step and
+  decode are serial even at 20 threads (the same in every variant).
+
+Raw data: `reference/runs/step27/b7/runs.tsv`, `b6/runs.tsv` (other_cpus 0.6–1.7 for every
+run used; the one 20-thread short-hv run disturbed by a compile, other_cpus 8.3, was dropped
+and re-run).
+
+### Item 7: the existing trainer, no extra resident memory
+
+Builds, stacked: *base* = Step 26; *a* = prior tables kept while the tension's bits are
+unchanged; *ab* = + phase-B plan cached per thread count, jobs claimed in chunks of ≈ 1/256 of
+a worker's share instead of one lock + atomic + two clock reads per job, trace-only work under
+`FA_TRACE_B`; *abd* = + phase-A/decode scratch (the two vocabulary-sized stamp arrays of
+`LineLookup`) handed between tasks of a phase instead of allocated per 4,096-line task.
+
+| corpus | thr | variant | prior | E-step | M-step | decode | total | peak MB |
+|---|---|---|---|---|---|---|---|---|
+| short-hv | 20 | base | 0.003 | 0.465 | 1.127 | 0.162 | 3.66 | 849 |
+| | | a | 0.001 | 0.461 | 1.135 | 0.163 | 3.68 | 858 |
+| | | ab | 0.001 | 0.459 | **0.935** | 0.158 | 3.58 | 810 |
+| | | abd | 0.001 | **0.374** | 0.935 | **0.135** | **3.47** | 817 |
+| short-hv | 1 | base | 0.000 | 4.450 | 3.283 | 1.537 | 16.67 | 458 |
+| | | a | 0.000 | 4.421 | 3.263 | 1.541 | 16.79 | 458 |
+| | | ab | 0.000 | 4.431 | **3.041** | 1.525 | 16.55 | 476 → 458 (slim) |
+| | | abd | 0.000 | **4.219** | 3.044 | **1.465** | **16.23** | 476 → 458 (slim) |
+| long-rep | 20 | base | 0.062 | 7.944 | 0.565 | 1.849 | 10.62 | 222 |
+| | | abd | 0.054 | 7.950 | 0.566 | 1.875 | 10.62 | 224 |
+| long-rep | 1 | base | 0.178 | 7.884 | 6.535 | 1.856 | 17.21 | 175 |
+| | | a | **0.146** | 7.850 | 6.549 | 1.846 | 17.17 | 175 |
+| | | abd | 0.148 | 7.857 | 6.568 | 1.837 | 17.17 | 175–194 (see below) |
+| en-fr large | 20 | base | 0.067 | 5.209 | 4.402 | 1.787 | 12.95 | 1691 |
+| | | a | **0.057** | 5.327 | 4.464 | 1.782 | 12.99 | 1707 |
+| | | abd | 0.064 | 5.202 | 4.393 | 1.846 | 12.92 | 1711 |
+| en-fr large | 1 | base | 0.253 | 55.334 | 26.296 | 17.314 | 110.47 | 1540 |
+| | | a | **0.207** | 55.458 | 26.217 | 17.359 | 110.44 | 1540 |
+| | | abd | 0.205 | 55.336 | 26.180 | 17.345 | 110.27 | 1533 |
+
+(ab and abd rows of long-rep and en-fr large are within noise of a; all rows in the TSV.)
+
+- **Prior reuse (kept):** −18 % on the prior stage at 1 thread (en-fr large 0.253 → 0.207 s,
+  long-rep 0.178 → 0.146 s): with `-o` the first two iterations share a tension; without `-o`
+  every iteration does. A small stage, so no visible change in total.
+- **Phase-B plan (kept):** M-step −17 % at 20 threads and −7 % at 1 thread on short-hv (393k–431k
+  jobs per direction, mostly tiny rows); no change where rows are few and long. The first version
+  stored the plan as 32-byte job descriptors plus a cost per job: +18 MB peak at 1 thread on
+  short-hv. Stored as one `u32` per job (row id, or a part number with the top bit), the peak is
+  back to 457.9 MB (= base; three runs each) at the same speed, and the per-job costs are only
+  computed for `FA_TRACE_B`.
+- **Scratch reuse (kept):** short-hv E-step −19 % at 20 threads (−5 % at 1), decode −15 % (−4 %);
+  the 245 tasks per iteration each zero-faulted two vocabulary-sized arrays (≈ 1.2M ids). No change
+  elsewhere. A phase holds at most one scratch per running task, as before. The 175 vs 194 MB peaks
+  of long-rep at 1 thread are not this change: the peak is at the very end of the run (writing),
+  and base gives 192 MB too when run outside the benchmark harness (`timed_run` alone, twice).
+- With all three, en-fr large is unchanged (12.92 vs 12.95 s at 20 threads, 110.3 vs 110.5 s at
+  1): its rows are few and long, its tasks large, and its prior a small stage.
+
+### Item 6: the opt-in cell-offset cache (`--offset-cache MB`, `offset_cache_mb`)
+
+The first E-step after the first M-step stores, for each line in corpus order while the budget
+lasts, the table cell (`u32`) of every distinct pair it looks up (the line's matrix, then the
+NULL row's cells); later E-steps and the decode read the probabilities through those offsets
+(prefetched 8 ahead) instead of the dense index / sampled search. Column-mode lines (Step 26)
+are never cached. Budget per direction; 0 (default) = off, nothing is allocated. *hit* = share
+of the distinct pairs looked up per pass that the cache covers. Build *abd* + the cache:
+
+| corpus | thr | budget | hit | cache MiB/dir | setup | E-step | decode | total | peak MB |
+|---|---|---|---|---|---|---|---|---|---|
+| en-fr large | 20 | 0 | – | – | 0.122 | 5.270 | 1.764 | 12.95 | 1694 |
+| | | 256 MiB | 0.15 | 256 | 0.144 | 5.002 | 1.762 | 12.68 | 1951 |
+| | | 1 GiB | 0.60 | 1026 | 0.153 | 4.405 | 1.276 | 11.72 | 2749 |
+| | | all (16 GiB) | 1.00 | 1723/1716 | 0.152 | **3.480** | **0.793** | **10.34** | 3409 |
+| en-fr large | 1 | 0 | – | – | 0.350 | 55.244 | 17.351 | 110.26 | 1537 |
+| | | 256 MiB | 0.15 | 256 | 0.486 | 52.849 | 15.874 | 106.50 | 1814 |
+| | | 1 GiB | 0.60 | 1026 | 0.504 | 44.662 | 11.287 | 93.96 | 2580 |
+| | | all | 1.00 | 1723/1716 | 0.509 | **37.530** | **7.021** | **82.41** | 3266 |
+| short-hv | 20 | 0 | – | – | 0.149 | 0.369 | 0.135 | 3.33 | 816 |
+| | | ≥ 256 MiB | 1.00 | 73/74 | 0.235–0.247 | 0.251–0.256 | 0.066 | 3.25–3.70 | 898–940 |
+| short-hv | 1 | 0 | – | – | 0.145 | 4.236 | 1.477 | 16.27 | 476 |
+| | | ≥ 256 MiB | 1.00 | 73/74 | 0.187 | 2.339–2.355 | 0.453–0.461 | 13.29–13.40 | 550 |
+| long-rep | 20 | 0 | – | – | 0.038 | 7.898 | 1.860 | 10.57 | 223 |
+| | | ≥ 256 MiB | 1.00 | 155 | 0.050 | 7.863–7.870 | 1.740–1.767 | 10.48–10.50 | 377–382 |
+| long-rep | 1 | 0 | – | – | 0.057 | 7.852 | 1.835 | 17.14 | 194 |
+| | | ≥ 256 MiB | 1.00 | 155 | 0.064 | 7.804–7.819 | 1.756–1.764 | 17.04–17.05 | 348 |
+
+M-step and prior are unchanged in every row (phase B does not use the cache).
+
+- **en-fr large, whole corpus cached (≈ 1.7 GB per direction): −25 % at 1 thread (110.3 → 82.4 s),
+  −20 % at 20 threads (12.95 → 10.34 s); peak 3.27 / 3.41 GB** — over the default path's 2 GB
+  target, under the 4 GB per 1M pairs ceiling (4.5 GB here). The gain is close to linear in the
+  hit rate (1 GiB: 60 % of the pairs, −15 % / −9.5 %). It is largest where lookups dominate a line
+  (at 1 thread, en-fr large: E-step −32 %, decode −60 %; short-hv: E-step −44 %, decode −69 %)
+  and nil where a line's time goes into its arithmetic (long-rep: −1 %, +155 MB).
+- Setup costs +0.15 s at 1 thread (counting each line's distinct words); the first cached
+  iteration costs nothing extra measurable (the offsets are written as the lookups happen).
+- **Kept as opt-in only**, as the plan requires: `--offset-cache MB` in both CLIs and
+  `train(offset_cache_mb=...)`; the default (0) path allocates nothing and is the *abd* build.
+  The parity suite was also run with the cache forced on (4 GiB, every line cached).
+
+### End to end through the native CLI (en-fr large, both directions + gdfa)
+
+`bench_cli.sh` (`fastalign train INPUT -o P -t T -s grow-diag-final-and`, `quiet_run
+--idle-cpus 1.5`, outputs identical to golden in every run); *base* = Step 26, *final* = all
+kept candidates (cache off, the default), *cache* = final with `--offset-cache 4096`.
+
+| threads | base | final | final + cache |
+|---|---|---|---|
+| 20 (wall, 3 runs) | 13.16 / 13.17 / 13.29 s | 12.99 / 13.09 / 13.11 s | **10.46 / 10.48 / 10.51 s** |
+| 20 (peak) | 1454–1475 MB | 1432–1455 MB | 3141–3148 MB |
+| 1, P-core (wall) | 110.7 / 110.8 / 112.1 s | 110.99 / 111.0 / 111.4 s | **83.0 s** |
+| 1 (peak) | 1290 MB (×3) | 1369–1370 MB (×3) | 3004 MB |
+
+The default path stays under the 2 GB target (≤ 1.46 GB at 20 threads, ≤ 1.37 GB at 1). The
+1-thread peak of *final* is 80 MB above *base*, but it is not memory any candidate holds: RSS is
+lower than base's throughout training (RSS timelines in `reference/runs/9b/enfr-large/
+cli-s27-*-t1.rss`), and both peaks are the last 3 s of the inverse direction's decode, while
+its output text grows. The 1-thread peak of each stacked commit: prior reuse alone 1354 MB
+(it allocates nothing new: the same tables are rebuilt less often), + plan 1345 MB, + scratch
+1370 MB; a decode pool per output window gave 1343 MB. The size of that spike depends on where
+the growing output buffer lands in the heap (whether glibc can grow it in place), not on what
+is live; the change was not kept.

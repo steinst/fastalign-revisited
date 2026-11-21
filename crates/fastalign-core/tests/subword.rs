@@ -1,6 +1,7 @@
 //! Subword alignment through the pipeline: training on a segmented corpus, projection to words,
 //! model save/load and forced alignment with the stored boundary.
 
+use fastalign_core::cancel::Cancel;
 use fastalign_core::corpus::{Corpus, LoadOptions};
 use fastalign_core::io::{Direction, Model, SubwordInfo};
 use fastalign_core::pipeline::{train, TrainConfig};
@@ -46,7 +47,7 @@ fn lines(n: usize, segmented: bool, marker: &str) -> String {
 }
 
 fn load(t: &str) -> Corpus {
-    Corpus::from_joined_bytes(t.as_bytes(), &LoadOptions::default())
+    Corpus::from_joined_bytes(t.as_bytes(), &LoadOptions::default()).unwrap()
 }
 
 fn cfg(sw: Option<Boundary>) -> TrainConfig {
@@ -80,8 +81,14 @@ fn identity_segmentation_equals_word_level() {
         })
         .collect();
     let marked = load(&marked_text);
-    let a = train(&plain, &cfg(None), &|_| {}).unwrap();
-    let b = train(&marked, &cfg(Some(Boundary::sentencepiece())), &|_| {}).unwrap();
+    let a = train(&plain, &cfg(None), &|_| {}, &Cancel::default()).unwrap();
+    let b = train(
+        &marked,
+        &cfg(Some(Boundary::sentencepiece())),
+        &|_| {},
+        &Cancel::default(),
+    )
+    .unwrap();
     for d in [Direction::Forward, Direction::Inverse] {
         assert_eq!(
             a.output(d).unwrap().alignments,
@@ -112,7 +119,13 @@ fn projection_matches_the_pieces_and_the_model_reproduces_it() {
         (Boundary::Start(b"##".to_vec()), "##"),
     ] {
         let corpus = load(&lines(300, true, marker));
-        let t = train(&corpus, &cfg(Some(boundary.clone())), &|_| {}).unwrap();
+        let t = train(
+            &corpus,
+            &cfg(Some(boundary.clone())),
+            &|_| {},
+            &Cancel::default(),
+        )
+        .unwrap();
         let mut bytes = Vec::new();
         t.model.write(&mut bytes).unwrap();
         let model = Model::read(&bytes[..], bytes.len() as u64).unwrap();
@@ -155,7 +168,9 @@ fn projection_matches_the_pieces_and_the_model_reproduces_it() {
             }
             // save -> load -> align reproduces the training alignments (words) byte for byte
             assert_eq!(
-                model.align_words(&corpus, d, false).unwrap(),
+                model
+                    .align_words(&corpus, d, false, &Cancel::default())
+                    .unwrap(),
                 o.alignments,
                 "{d:?}"
             );
@@ -191,12 +206,14 @@ fn continuation_convention_works_end_to_end() {
         &load(&lines(200, true, "\u{2581}")),
         &cfg(Some(Boundary::sentencepiece())),
         &|_| {},
+        &Cancel::default(),
     )
     .unwrap();
     let b = train(
         &load(&text),
         &cfg(Some(Boundary::Continue(b"@@".to_vec()))),
         &|_| {},
+        &Cancel::default(),
     )
     .unwrap();
     // different piece strings, so different ids and hash orders: the alignments may differ in
@@ -221,7 +238,157 @@ fn continuation_convention_works_end_to_end() {
 #[test]
 fn subword_off_leaves_outputs_alone() {
     let corpus = load(&lines(100, false, ""));
-    let t = train(&corpus, &cfg(None), &|_| {}).unwrap();
+    let t = train(&corpus, &cfg(None), &|_| {}, &Cancel::default()).unwrap();
     assert!(t.model.subword.is_none());
     assert!(t.fwd.unwrap().subword_alignments.is_none());
+}
+
+/// The words of each line of one side of a paired text (space/tab separated).
+fn side_lines(text: &str) -> Vec<Vec<&[u8]>> {
+    text.lines()
+        .map(|l| {
+            l.split([' ', '\t'])
+                .filter(|w| !w.is_empty())
+                .map(str::as_bytes)
+                .collect()
+        })
+        .collect()
+}
+
+#[test]
+fn one_pair_path_equals_the_corpus_path() {
+    // Step 24: `align_tokens_words` (no corpus, no text) gives exactly the links of the
+    // corresponding line of `align_words`, in its order, for word and subword models, both
+    // directions; a corpus mapped once serves both directions.
+    for (boundary, marker) in [
+        (None, ""),
+        (Some(Boundary::sentencepiece()), "\u{2581}"),
+        (Some(Boundary::Start(b"##".to_vec())), "##"),
+    ] {
+        let segmented = boundary.is_some();
+        let train_text = lines(300, segmented, marker);
+        let corpus = load(&train_text);
+        let t = train(&corpus, &cfg(boundary), &|_| {}, &Cancel::default()).unwrap();
+        let mut bytes = Vec::new();
+        t.model.write(&mut bytes).unwrap();
+        let model = Model::read(&bytes[..], bytes.len() as u64).unwrap();
+        // new text: other lines, unknown words, an empty side, the words `|||` and `<eps>`
+        let mut new_text = lines(60, segmented, marker).replace("w1", "u1");
+        new_text.push_str(" ||| v3 v4\nw2 ||| \n|||\tw3 <eps> ||| v2\n");
+        let (mut src, mut tgt) = (String::new(), String::new());
+        for l in new_text.lines() {
+            let (a, b) = l.split_once(" ||| ").unwrap();
+            src.push_str(a);
+            src.push('\n');
+            tgt.push_str(b);
+            tgt.push('\n');
+        }
+        let new = Corpus::from_pair_bytes(src.as_bytes(), tgt.as_bytes(), &LoadOptions::default())
+            .unwrap();
+        let (sl, tl) = (side_lines(&src), side_lines(&tgt));
+        assert_eq!(sl.len(), new.len());
+        let mapped = model.map_corpus(&new);
+        let mut per_dir = Vec::new();
+        for d in [Direction::Forward, Direction::Inverse] {
+            let text = model
+                .align_words(&new, d, false, &Cancel::default())
+                .unwrap();
+            assert_eq!(
+                model
+                    .align_words_mapped(&mapped, d, false, &Cancel::default())
+                    .unwrap(),
+                text
+            );
+            let mut direct = Vec::new();
+            for (k, line) in text.split(|&b| b == b'\n').take(new.len()).enumerate() {
+                let links = model.align_tokens_words(d, &sl[k], &tl[k]).unwrap();
+                let mut got = Vec::new();
+                fastalign_core::symmetrize::format_links(&links, &mut got);
+                assert_eq!(got, line, "{d:?} line {k}");
+                direct.push(links);
+            }
+            per_dir.push((text, direct));
+        }
+        let (inv_text, inv) = per_dir.pop().unwrap();
+        let (fwd_text, fwd) = per_dir.pop().unwrap();
+        for m in [Method::Intersect, Method::GrowDiagFinalAnd, Method::Union] {
+            let want =
+                fastalign_core::pipeline::symmetrize_pharaoh(&fwd_text, &inv_text, m).unwrap();
+            let mut got = Vec::new();
+            for (f, i) in fwd.iter().zip(&inv) {
+                let (mut f, mut i) = (f.clone(), i.clone());
+                f.sort_unstable();
+                i.sort_unstable();
+                let s = fastalign_core::symmetrize::symmetrize(&f, &i, m);
+                fastalign_core::symmetrize::format_links(&s, &mut got);
+                got.push(b'\n');
+            }
+            assert_eq!(got, want, "{m:?}");
+        }
+    }
+}
+
+#[test]
+fn word_index_finds_every_word() {
+    let corpus = load(&lines(300, true, "\u{2581}"));
+    let t = train(&corpus, &cfg(None), &|_| {}, &Cancel::default()).unwrap();
+    let m = &t.model;
+    for id in 1..m.vocab.len() as u32 {
+        assert_eq!(m.word_id(m.vocab.word(id)), Some(id));
+    }
+    for w in [&b""[..], b"nope", b"\xff", b"<bad0>x"] {
+        assert_eq!(m.word_id(w), None);
+    }
+    // id 0 is never a word
+    assert_eq!(m.word_id(b"<bad0>"), None);
+    // a duplicated word (only a corrupt file has one) maps to its last id
+    let v =
+        fastalign_core::corpus::Vocab::from_words([&b"<bad0>"[..], b"<eps>", b"|||", b"a", b"a"]);
+    assert_eq!(
+        fastalign_core::io::WordIndex::new(&v).get(&v, b"a"),
+        Some(4)
+    );
+    // simultaneous first users all get the one index
+    let fresh = Model::new(m.vocab.clone(), None, None);
+    std::thread::scope(|s| {
+        for _ in 0..8 {
+            s.spawn(|| assert_eq!(fresh.word_id(m.vocab.word(5)), Some(5)));
+        }
+    });
+}
+
+/// Step 25: projection is written in ordered windows of chunks; the text is the same whatever
+/// the pool (one worker makes the windows smallest), and has one line per corpus line.
+#[test]
+fn projection_windows_keep_order() {
+    use fastalign_core::pipeline::with_threads;
+    use fastalign_core::subword::project_text;
+    // 40k lines (> 4 windows of 4 chunks of 4096 lines at one worker); every line differs in
+    // the number of links so that a swapped chunk shows
+    let mut corpus_text = String::new();
+    let mut aligned = String::new();
+    for k in 0..40_000usize {
+        let n = 1 + k % 5;
+        let src: Vec<String> = (0..n).map(|i| format!("▁s{i}")).collect();
+        let tgt: Vec<String> = (0..n).map(|i| format!("▁t{i}")).collect();
+        corpus_text.push_str(&format!("{} ||| {}\n", src.join(" "), tgt.join(" ")));
+        let links: Vec<String> = (0..n).map(|i| format!("{i}-{i}")).collect();
+        aligned.push_str(&links.join(" "));
+        aligned.push('\n');
+    }
+    let corpus =
+        Corpus::from_joined_bytes(corpus_text.as_bytes(), &LoadOptions::default()).unwrap();
+    let b = Boundary::sentencepiece();
+    let run = |threads| {
+        with_threads(threads, || {
+            project_text(&corpus, &b, aligned.as_bytes(), false, &Cancel::default()).unwrap()
+        })
+        .unwrap()
+    };
+    let one = run(1);
+    assert_eq!(one.iter().filter(|&&c| c == b'\n').count(), 40_000);
+    assert_eq!(one, run(3));
+    assert_eq!(one, run(8));
+    // every token is its own word here, so projection is the identity (forward: target order)
+    assert_eq!(one, aligned.as_bytes());
 }
